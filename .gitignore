@@ -1,0 +1,13 @@
+.build/
+.swiftpm/
+dist/
+*.screenfree
+*.mov
+*.mp4
+.DS_Store
+.codex
+.agents
+.claude
+AGENTS.md
+CLAUDE.md
+*.mp4

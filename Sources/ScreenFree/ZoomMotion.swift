@@ -1,0 +1,354 @@
+import CoreGraphics
+import Foundation
+import ScreenFreeCore
+
+enum ZoomMotionPreset: String, CaseIterable, Codable, Identifiable, Sendable {
+    case slow = "Slow"
+    case mellow = "Mellow"
+    case quick = "Quick"
+    case rapid = "Rapid"
+    case custom = "Customize"
+
+    var id: Self { self }
+
+    var transitionDuration: TimeInterval {
+        switch self {
+        case .slow: return 1.05
+        case .mellow: return 0.82
+        case .quick: return 0.46
+        case .rapid: return 0.24
+        case .custom: return 0.82
+        }
+    }
+
+    var exportSampleCount: Int {
+        switch self {
+        case .slow: return 16
+        case .mellow: return 12
+        case .quick: return 10
+        case .rapid: return 8
+        case .custom: return 18
+        }
+    }
+
+    func easedProgress(_ value: CGFloat) -> CGFloat {
+        let t = value.clamped(to: 0...1)
+        switch self {
+        case .slow:
+            // Smootherstep: zero velocity and acceleration at both ends.
+            return t * t * t * (t * (t * 6 - 15) + 10)
+        case .mellow:
+            // Screen Studio-style ease: no abrupt velocity at either edge.
+            return t * t * t * (t * (t * 6 - 15) + 10)
+        case .quick:
+            return 1 - pow(1 - t, 3)
+        case .rapid:
+            return 1 - pow(1 - t, 5)
+        case .custom:
+            return CubicBezierEasing.defaultCurve.value(at: t)
+        }
+    }
+}
+
+struct CubicBezierEasing: Codable, Equatable, Sendable {
+    var x1: CGFloat
+    var y1: CGFloat
+    var x2: CGFloat
+    var y2: CGFloat
+
+    static let defaultCurve = CubicBezierEasing(
+        x1: 0.25,
+        y1: 0.1,
+        x2: 0.25,
+        y2: 1
+    )
+
+    func clamped() -> CubicBezierEasing {
+        CubicBezierEasing(
+            x1: x1.clamped(to: 0...1),
+            y1: y1.clamped(to: 0...1),
+            x2: x2.clamped(to: 0...1),
+            y2: y2.clamped(to: 0...1)
+        )
+    }
+
+    func value(at progress: CGFloat) -> CGFloat {
+        let target = progress.clamped(to: 0...1)
+        let curve = clamped()
+        var parameter = target
+        for _ in 0..<8 {
+            let error = curve.coordinate(
+                parameter,
+                first: curve.x1,
+                second: curve.x2
+            ) - target
+            if abs(error) < 0.000_01 { break }
+            let derivative = curve.derivative(
+                parameter,
+                first: curve.x1,
+                second: curve.x2
+            )
+            if abs(derivative) < 0.000_01 { break }
+            parameter = (parameter - error / derivative).clamped(to: 0...1)
+        }
+        if abs(
+            curve.coordinate(
+                parameter,
+                first: curve.x1,
+                second: curve.x2
+            ) - target
+        ) > 0.000_1 {
+            var lower: CGFloat = 0
+            var upper: CGFloat = 1
+            for _ in 0..<14 {
+                parameter = (lower + upper) / 2
+                if curve.coordinate(
+                    parameter,
+                    first: curve.x1,
+                    second: curve.x2
+                ) < target {
+                    lower = parameter
+                } else {
+                    upper = parameter
+                }
+            }
+        }
+        return curve.coordinate(
+            parameter,
+            first: curve.y1,
+            second: curve.y2
+        ).clamped(to: 0...1)
+    }
+
+    private func coordinate(
+        _ t: CGFloat,
+        first: CGFloat,
+        second: CGFloat
+    ) -> CGFloat {
+        let inverse = 1 - t
+        return 3 * inverse * inverse * t * first
+            + 3 * inverse * t * t * second
+            + t * t * t
+    }
+
+    private func derivative(
+        _ t: CGFloat,
+        first: CGFloat,
+        second: CGFloat
+    ) -> CGFloat {
+        let inverse = 1 - t
+        return 3 * inverse * inverse * first
+            + 6 * inverse * t * (second - first)
+            + 3 * t * t * (1 - second)
+    }
+}
+
+struct ZoomMotionStyle: Codable, Equatable, Sendable {
+    var preset: ZoomMotionPreset
+    var customTransitionDuration: TimeInterval
+    var customEasing: CubicBezierEasing
+
+    init(
+        preset: ZoomMotionPreset,
+        customTransitionDuration: TimeInterval = 0.82,
+        customEasing: CubicBezierEasing = .defaultCurve
+    ) {
+        self.preset = preset
+        self.customTransitionDuration = customTransitionDuration
+        self.customEasing = customEasing
+    }
+
+    static let slow = ZoomMotionStyle(preset: .slow)
+    static let mellow = ZoomMotionStyle(preset: .mellow)
+    static let quick = ZoomMotionStyle(preset: .quick)
+    static let rapid = ZoomMotionStyle(preset: .rapid)
+
+    var transitionDuration: TimeInterval {
+        preset == .custom
+            ? customTransitionDuration.clamped(to: 0.08...1.5)
+            : preset.transitionDuration
+    }
+
+    var exportSampleCount: Int {
+        preset.exportSampleCount
+    }
+
+    func easedProgress(_ value: CGFloat) -> CGFloat {
+        preset == .custom
+            ? customEasing.value(at: value)
+            : preset.easedProgress(value)
+    }
+}
+
+struct ResolvedZoomMotion {
+    let zoom: ZoomEvent
+    let scale: CGFloat
+    let focusX: CGFloat
+    let focusY: CGFloat
+}
+
+enum ZoomMotionResolver {
+    private static let continuityTolerance: TimeInterval = 1.0 / 120.0
+
+    private struct Segment {
+        let zoom: ZoomEvent
+        let start: TimeInterval
+        let end: TimeInterval
+    }
+
+    static func state(
+        at time: TimeInterval,
+        zooms: [ZoomEvent],
+        totalDuration: TimeInterval,
+        motion: ZoomMotionStyle
+    ) -> ResolvedZoomMotion? {
+        let segments = normalizedSegments(
+            zooms: zooms,
+            totalDuration: totalDuration
+        )
+        for (index, segment) in segments.enumerated() {
+            guard time >= segment.start, time <= segment.end else {
+                continue
+            }
+
+            let previous = index > 0 ? segments[index - 1] : nil
+            let next = index + 1 < segments.count
+                ? segments[index + 1]
+                : nil
+            let joinsPrevious = previous.map {
+                segment.start - $0.end <= continuityTolerance
+            } ?? false
+            let joinsNext = next.map {
+                $0.start - segment.end <= continuityTolerance
+            } ?? false
+            let ramp = min(
+                motion.transitionDuration,
+                (segment.end - segment.start) / 2
+            )
+
+            if joinsPrevious, let previous, ramp > 0,
+               time < segment.start + ramp {
+                let rawProgress = CGFloat(
+                    (time - segment.start) / ramp
+                ).clamped(to: 0...1)
+                let progress = motion.easedProgress(rawProgress)
+                return ResolvedZoomMotion(
+                    zoom: segment.zoom,
+                    scale: interpolate(
+                        from: CGFloat(previous.zoom.scale),
+                        to: CGFloat(segment.zoom.scale),
+                        progress: progress
+                    ),
+                    focusX: interpolate(
+                        from: CGFloat(previous.zoom.focusX),
+                        to: CGFloat(segment.zoom.focusX),
+                        progress: progress
+                    ),
+                    focusY: interpolate(
+                        from: CGFloat(previous.zoom.focusY),
+                        to: CGFloat(segment.zoom.focusY),
+                        progress: progress
+                    )
+                )
+            }
+
+            let progress: CGFloat
+            if !joinsPrevious, ramp > 0, time < segment.start + ramp {
+                progress = motion.easedProgress(
+                    CGFloat((time - segment.start) / ramp)
+                )
+            } else if !joinsNext, ramp > 0, time > segment.end - ramp {
+                progress = motion.easedProgress(
+                    CGFloat((segment.end - time) / ramp)
+                )
+            } else {
+                progress = 1
+            }
+            return ResolvedZoomMotion(
+                zoom: segment.zoom,
+                scale: 1 + (segment.zoom.scale - 1) * progress,
+                focusX: CGFloat(segment.zoom.focusX),
+                focusY: CGFloat(segment.zoom.focusY)
+            )
+        }
+        return nil
+    }
+
+    static func activeRanges(
+        zooms: [ZoomEvent],
+        totalDuration: TimeInterval
+    ) -> [ClosedRange<TimeInterval>] {
+        let segments = normalizedSegments(
+            zooms: zooms,
+            totalDuration: totalDuration
+        )
+        var ranges: [ClosedRange<TimeInterval>] = []
+        for segment in segments {
+            if let last = ranges.last,
+               segment.start - last.upperBound <= continuityTolerance {
+                ranges[ranges.count - 1] =
+                    last.lowerBound...max(last.upperBound, segment.end)
+            } else {
+                ranges.append(segment.start...segment.end)
+            }
+        }
+        return ranges
+    }
+
+    static func state(
+        at time: TimeInterval,
+        zooms: [ZoomEvent],
+        totalDuration: TimeInterval,
+        preset: ZoomMotionPreset
+    ) -> ResolvedZoomMotion? {
+        state(
+            at: time,
+            zooms: zooms,
+            totalDuration: totalDuration,
+            motion: ZoomMotionStyle(preset: preset)
+        )
+    }
+
+    private static func normalizedSegments(
+        zooms: [ZoomEvent],
+        totalDuration: TimeInterval
+    ) -> [Segment] {
+        guard totalDuration > 0 else { return [] }
+        var lastEnd: TimeInterval = 0
+        var segments: [Segment] = []
+        for zoom in zooms.sorted(by: { $0.start < $1.start }) {
+            let start = max(lastEnd, zoom.start)
+                .clamped(to: 0...totalDuration)
+            let end = min(totalDuration, zoom.end)
+            defer { lastEnd = max(lastEnd, end) }
+            guard end - start >= 0.1 - 0.000_001 else { continue }
+            segments.append(
+                Segment(
+                    zoom: zoom,
+                    start: start,
+                    end: end
+                )
+            )
+        }
+        return segments
+    }
+
+    private static func interpolate(
+        from start: CGFloat,
+        to end: CGFloat,
+        progress: CGFloat
+    ) -> CGFloat {
+        start + (end - start) * progress.clamped(to: 0...1)
+    }
+}
+
+enum AutomaticZoomPolicy {
+    static func shouldGenerate(
+        enabled: Bool,
+        clicks: [MouseClick]
+    ) -> Bool {
+        enabled && clicks.contains {
+            AutomaticZoomTriggerPolicy.shouldTriggerZoom(for: $0)
+        }
+    }
+}
