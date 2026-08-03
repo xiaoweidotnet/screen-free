@@ -95,6 +95,7 @@ final class EditorStore: ObservableObject {
         case captions = "Captions"
         case clip = "Clip"
         case zoom = "Zoom"
+        case transition = "Transitions"
         case privacy = "Privacy"
         case annotation = "Annotations"
         case export = "Export"
@@ -111,6 +112,7 @@ final class EditorStore: ObservableObject {
             case .captions: return "captions.bubble"
             case .clip: return "film.stack"
             case .zoom: return "plus.magnifyingglass"
+            case .transition: return "rectangle.2.swap"
             case .privacy: return "eye.slash"
             case .annotation: return "pencil.and.outline"
             case .export: return "square.and.arrow.up"
@@ -311,6 +313,9 @@ final class EditorStore: ObservableObject {
     @Published var shadowStrength: Double = 0.52
     @Published var zoomScale: Double = 1.8
     @Published var zoomDuration: Double = 3.2
+    @Published var transitionStyle: ClipTransitionStyle = .fade
+    @Published var transitionDuration: Double = 0.4
+    @Published var selectedTransitionID: UUID?
     @Published var zoomMotionPreset: ZoomMotionPreset = .mellow
     @Published var zoomCustomTransitionDuration: Double = 0.82
     @Published var zoomCustomX1: Double = 0.25
@@ -989,6 +994,25 @@ final class EditorStore: ObservableObject {
         }
     }
 
+    /// Permanently deletes recordings from disk and refreshes the history.
+    func deleteRecordingsFromHistory(_ items: [RecordingHistoryItem]) {
+        guard !items.isEmpty else { return }
+        let deletedCurrentSource = items.contains {
+            $0.url.standardizedFileURL == sourceURL?.standardizedFileURL
+        }
+        let deleted = recordingHistoryCatalog.delete(items)
+        refreshRecordingHistory()
+        guard deleted > 0 else {
+            errorMessage = "The selected recordings could not be deleted."
+            return
+        }
+        if deletedCurrentSource {
+            statusMessage = "The open recording was deleted from disk."
+        } else {
+            statusMessage = "Deleted \(deleted) recording(s)."
+        }
+    }
+
     func importBackgroundMusic() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.audio]
@@ -1463,6 +1487,7 @@ final class EditorStore: ObservableObject {
         selectedZoomID = nil
         selectedRedactionID = nil
         selectedAnnotationID = nil
+        selectedTransitionID = nil
         activeTimelineTool = .selection
         playhead = 0
         audioAnalysis = .empty
@@ -1936,6 +1961,108 @@ final class EditorStore: ObservableObject {
             registerTimelineEdit("Trim Clip", before: snapshot)
             statusMessage = start ? "Trimmed 0.25s from clip start." : "Trimmed 0.25s from clip end."
         }
+    }
+
+    /// Current transition visual state for the preview, resolved through the
+    /// same logic the export pipeline samples.
+    func transitionFrame(at time: TimeInterval) -> ClipTransitionFrame {
+        ClipTransitionResolver.frame(
+            junctions: project.transitionJunctions(),
+            at: time
+        )
+    }
+
+    /// Places (or replaces) a transition on the junction between two
+    /// adjacent clips, using the current template duration.
+    func applyTransition(
+        _ style: ClipTransitionStyle,
+        toJunction junction: TransitionJunction
+    ) {
+        let snapshot = captureTimelineSnapshot()
+        let transition = ClipTransition(
+            leftClipID: junction.leftClipID,
+            rightClipID: junction.rightClipID,
+            style: style,
+            duration: transitionDuration.clamped(
+                to: ClipTransitionResolver.minimumDuration...ClipTransitionResolver.maximumDuration
+            )
+        )
+        project.setTransition(transition)
+        selectedTransitionID = project.transitionJunctions().first {
+            $0.leftClipID == junction.leftClipID
+                && $0.rightClipID == junction.rightClipID
+        }?.transition?.id
+        inspectorPanel = .transition
+        registerTimelineEdit("Apply Transition", before: snapshot)
+        statusMessage = "Transition applied."
+    }
+
+    func updateSelectedTransition(
+        style: ClipTransitionStyle? = nil,
+        duration: TimeInterval? = nil
+    ) {
+        guard let selectedTransitionID,
+              let index = project.transitions.firstIndex(where: {
+                  $0.id == selectedTransitionID
+              }) else { return }
+        let snapshot = captureTimelineSnapshot()
+        if let style {
+            project.transitions[index].style = style
+        }
+        if let duration {
+            project.transitions[index].duration = duration.clamped(
+                to: ClipTransitionResolver.minimumDuration...ClipTransitionResolver.maximumDuration
+            )
+        }
+        registerTimelineEdit("Update Transition", before: snapshot)
+    }
+
+    func removeSelectedTransition() {
+        guard let selectedTransitionID,
+              project.transitions.contains(where: {
+                  $0.id == selectedTransitionID
+              }) else { return }
+        let snapshot = captureTimelineSnapshot()
+        project.transitions.removeAll { $0.id == selectedTransitionID }
+        self.selectedTransitionID = nil
+        registerTimelineEdit("Remove Transition", before: snapshot)
+        statusMessage = "Transition removed."
+    }
+
+    /// Seeks just before a transition and plays so it can be previewed.
+    func previewTransition() {
+        let junctions = project.transitionJunctions()
+        let target = junctions.first {
+            $0.transition?.id == selectedTransitionID
+        } ?? junctions.first { $0.transition != nil }
+        guard let junction = target, junction.transition != nil else {
+            statusMessage = "Drag a transition onto a cut between clips."
+            return
+        }
+        let duration = junction.transition?.duration ?? transitionDuration
+        seek(to: max(0, junction.time - max(1, duration)))
+        if !isPlaying {
+            togglePlayback()
+        }
+    }
+
+    /// Removes silent footage from the start and end of the recording only.
+    func smartTrimSilence() {
+        guard !audioAnalysis.waveform.isEmpty else {
+            statusMessage = "An audio track is required to smart trim."
+            return
+        }
+        let snapshot = captureTimelineSnapshot()
+        guard project.trimSilenceAtEdges(
+            waveform: audioAnalysis.waveform,
+            sourceDuration: sourceDuration
+        ) else {
+            statusMessage = "No silent footage at the start or end."
+            return
+        }
+        seek(to: min(playhead, project.duration))
+        registerTimelineEdit("Smart Trim", before: snapshot)
+        statusMessage = "Removed silent footage from the start and end."
     }
 
     func resetSelectedTrim() {
@@ -3382,6 +3509,8 @@ final class EditorStore: ObservableObject {
             cameraCornerRadius: cameraCornerRadius,
             cameraMirrored: cameraMirrored,
             cameraPosition: cameraPosition,
+            transitionStyle: transitionStyle,
+            transitionDuration: transitionDuration,
             updatedAt: Date()
         )
     }
@@ -3459,6 +3588,9 @@ final class EditorStore: ObservableObject {
         cameraCornerRadius = snapshot.cameraCornerRadius
         cameraMirrored = snapshot.cameraMirrored
         cameraPosition = snapshot.cameraPosition
+        transitionStyle = snapshot.transitionStyle ?? .fade
+        transitionDuration = (snapshot.transitionDuration ?? 0.4)
+            .clamped(to: 0.2...1.2)
         cameraPlayer.pause()
         cameraPlayer.replaceCurrentItem(with: nil)
         cameraURL = nil

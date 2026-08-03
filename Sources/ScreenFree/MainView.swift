@@ -7,6 +7,12 @@ struct MainView: View {
     @ObservedObject var store: EditorStore
     @State private var showCanvasSizePicker = false
     @State private var showRecordingHistory = false
+    @State private var historySelectionMode = false
+    @State private var historySelection: Set<String> = []
+    @State private var historyPendingDeletion: [RecordingHistoryItem] = []
+    @State private var showHistoryDeleteConfirmation = false
+    @AppStorage("showPanelRail") private var showPanelRail = true
+    @AppStorage("showInspector") private var showInspector = true
     @State private var isPreviewFullscreen = false
     @State private var previewOwnsNativeFullscreen = false
     @State private var annotationDragStart: CGPoint?
@@ -105,8 +111,10 @@ struct MainView: View {
             Divider().overlay(.white.opacity(0.06))
 
             HStack(spacing: 0) {
-                panelRail
-                Divider().overlay(.white.opacity(0.06))
+                if showPanelRail {
+                    panelRail
+                    Divider().overlay(.white.opacity(0.06))
+                }
 
                 VStack(spacing: 0) {
                     preview
@@ -115,9 +123,17 @@ struct MainView: View {
                         .frame(height: 159)
                 }
 
-                Divider().overlay(.white.opacity(0.06))
-                inspector
-                    .frame(width: 292)
+                if showInspector {
+                    Divider().overlay(.white.opacity(0.06))
+                    inspector
+                        .frame(width: 292)
+                }
+            }
+            .onChange(of: store.inspectorPanel) { _ in
+                guard !showInspector else { return }
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showInspector = true
+                }
             }
 
             statusBar
@@ -187,6 +203,18 @@ struct MainView: View {
 
     private var toolbar: some View {
         HStack(spacing: 12) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showPanelRail.toggle()
+                }
+            } label: {
+                Image(systemName: "sidebar.leading")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(showPanelRail ? .primary : .secondary)
+            }
+            .buttonStyle(.plain)
+            .help(Text("Toggle left panel"))
+
             HStack(spacing: 9) {
                 Image(systemName: "sparkles.rectangle.stack.fill")
                     .font(.system(size: 19, weight: .semibold))
@@ -291,6 +319,18 @@ struct MainView: View {
             }
             .buttonStyle(AccentButtonStyle(colors: [.indigo, .blue]))
             .disabled(store.sourceURL == nil || store.isExporting)
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showInspector.toggle()
+                }
+            } label: {
+                Image(systemName: "sidebar.trailing")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(showInspector ? .primary : .secondary)
+            }
+            .buttonStyle(.plain)
+            .help(Text("Toggle right panel"))
         }
         .padding(.horizontal, 16)
         .frame(height: 54)
@@ -301,7 +341,7 @@ struct MainView: View {
         VStack(spacing: 7) {
             ForEach(primaryRailPanels) { panel in
                 Button {
-                    store.inspectorPanel = panel
+                    selectInspectorPanel(panel)
                 } label: {
                     railIcon(
                         symbol: panel.symbol,
@@ -315,7 +355,7 @@ struct MainView: View {
             Menu {
                 ForEach(editingRailPanels) { panel in
                     Button {
-                        store.inspectorPanel = panel
+                        selectInspectorPanel(panel)
                     } label: {
                         Label(
                             LocalizedStringKey(panel.rawValue),
@@ -346,8 +386,17 @@ struct MainView: View {
         [.recording, .canvas, .cursor, .audio]
     }
 
+    private func selectInspectorPanel(_ panel: EditorStore.InspectorPanel) {
+        store.inspectorPanel = panel
+        if !showInspector {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                showInspector = true
+            }
+        }
+    }
+
     private var editingRailPanels: [EditorStore.InspectorPanel] {
-        [.camera, .captions, .clip, .zoom]
+        [.camera, .captions, .clip, .zoom, .transition]
     }
 
     private func railIcon(symbol: String, selected: Bool) -> some View {
@@ -419,6 +468,7 @@ struct MainView: View {
             let motionBlur = store.resolvedMotionBlur(
                 renderSize: contentSize
             )
+            let transitionFrame = store.transitionFrame(at: store.playhead)
 
             ZStack {
                 CanvasBackgroundView(store: store)
@@ -432,7 +482,7 @@ struct MainView: View {
                     )
                         .disabled(true)
                         .scaleEffect(
-                            scale,
+                            scale * transitionFrame.contentScale,
                             anchor: UnitPoint(
                                 x: mappedFocus.x,
                                 y: mappedFocus.y
@@ -471,6 +521,20 @@ struct MainView: View {
                                     }
                                     .shadow(color: .black.opacity(0.55), radius: 14, y: 7)
                                     .padding(store.canvasPadding + 16)
+                            }
+                        }
+                        .overlay {
+                            if transitionFrame.dipOpacity > 0.001 {
+                                RoundedRectangle(
+                                    cornerRadius: store.cornerRadius
+                                )
+                                    .fill(
+                                        transitionFrame.dipIsWhite
+                                            ? Color.white : Color.black
+                                    )
+                                    .padding(store.canvasPadding)
+                                    .opacity(transitionFrame.dipOpacity)
+                                    .allowsHitTesting(false)
                             }
                         }
                         .overlay {
@@ -1019,6 +1083,21 @@ struct MainView: View {
                 Label("Recording history", systemImage: "clock.arrow.circlepath")
                     .font(.headline)
                 Spacer()
+                if !store.recordingHistory.isEmpty {
+                    Button {
+                        historySelectionMode.toggle()
+                        if !historySelectionMode {
+                            historySelection.removeAll()
+                        }
+                    } label: {
+                        if historySelectionMode {
+                            Text("Done")
+                        } else {
+                            Text("Select")
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                }
                 Button {
                     store.refreshRecordingHistory()
                 } label: {
@@ -1047,6 +1126,46 @@ struct MainView: View {
                         }
                     }
                 }
+                if historySelectionMode {
+                    Divider()
+                    HStack {
+                        Button {
+                            if historySelection.count
+                                == store.recordingHistory.count {
+                                historySelection.removeAll()
+                            } else {
+                                historySelection = Set(
+                                    store.recordingHistory.map(\.id)
+                                )
+                            }
+                        } label: {
+                            if historySelection.count
+                                == store.recordingHistory.count {
+                                Text("Deselect all")
+                            } else {
+                                Text("Select all")
+                            }
+                        }
+                        .buttonStyle(.borderless)
+                        Spacer()
+                        Button(role: .destructive) {
+                            requestHistoryDeletion(
+                                store.recordingHistory.filter {
+                                    historySelection.contains($0.id)
+                                }
+                            )
+                        } label: {
+                            Text(
+                                L10n.text(
+                                    "Delete (%d)",
+                                    language: store.appLanguage,
+                                    historySelection.count
+                                )
+                            )
+                        }
+                        .disabled(historySelection.isEmpty)
+                    }
+                }
             }
         }
         .padding(14)
@@ -1054,16 +1173,86 @@ struct MainView: View {
         .onAppear {
             store.refreshRecordingHistory()
         }
+        .onDisappear {
+            historySelectionMode = false
+            historySelection.removeAll()
+        }
+        .alert(
+            historyDeletionTitle,
+            isPresented: $showHistoryDeleteConfirmation
+        ) {
+            Button(role: .destructive) {
+                store.deleteRecordingsFromHistory(historyPendingDeletion)
+                historySelection.subtract(
+                    historyPendingDeletion.map(\.id)
+                )
+                historyPendingDeletion = []
+            } label: {
+                Text("Delete")
+            }
+            Button(role: .cancel) {
+                historyPendingDeletion = []
+            } label: {
+                Text("Cancel")
+            }
+        } message: {
+            Text(
+                "The video file will be permanently deleted from your disk. This cannot be undone."
+            )
+        }
+    }
+
+    private var historyDeletionTitle: Text {
+        if historyPendingDeletion.count > 1 {
+            return Text(
+                L10n.text(
+                    "Delete %d recordings?",
+                    language: store.appLanguage,
+                    historyPendingDeletion.count
+                )
+            )
+        }
+        return Text("Delete this recording?")
+    }
+
+    private func toggleHistorySelection(_ item: RecordingHistoryItem) {
+        if historySelection.contains(item.id) {
+            historySelection.remove(item.id)
+        } else {
+            historySelection.insert(item.id)
+        }
+    }
+
+    private func requestHistoryDeletion(_ items: [RecordingHistoryItem]) {
+        guard !items.isEmpty else { return }
+        historyPendingDeletion = items
+        showHistoryDeleteConfirmation = true
     }
 
     private func recordingHistoryRow(
         _ item: RecordingHistoryItem
     ) -> some View {
         Button {
-            showRecordingHistory = false
-            Task { await store.openRecordingFromHistory(item) }
+            if historySelectionMode {
+                toggleHistorySelection(item)
+            } else {
+                showRecordingHistory = false
+                Task { await store.openRecordingFromHistory(item) }
+            }
         } label: {
             HStack(spacing: 11) {
+                if historySelectionMode {
+                    Image(
+                        systemName: historySelection.contains(item.id)
+                            ? "checkmark.circle.fill" : "circle"
+                    )
+                    .font(.system(size: 16))
+                    .foregroundStyle(
+                        historySelection.contains(item.id)
+                            ? Color.accentColor : Color.secondary
+                    )
+                }
+
                 Image(systemName: "film.fill")
                     .font(.system(size: 17))
                     .foregroundStyle(.purple)
@@ -1085,14 +1274,27 @@ struct MainView: View {
                     .lineLimit(1)
                 }
                 Spacer()
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.tertiary)
+                if !historySelectionMode {
+                    Button {
+                        requestHistoryDeletion([item])
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .help("Delete recording")
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
             }
             .padding(9)
             .contentShape(Rectangle())
             .background(
-                Color.white.opacity(0.045),
+                historySelectionMode && historySelection.contains(item.id)
+                    ? Color.accentColor.opacity(0.18)
+                    : Color.white.opacity(0.045),
                 in: RoundedRectangle(cornerRadius: 10)
             )
         }
@@ -1108,6 +1310,12 @@ struct MainView: View {
                 NSWorkspace.shared.activateFileViewerSelecting([item.url])
             } label: {
                 Label("Show in Finder", systemImage: "folder")
+            }
+            Divider()
+            Button(role: .destructive) {
+                requestHistoryDeletion([item])
+            } label: {
+                Label("Delete recording", systemImage: "trash")
             }
         }
     }
@@ -1163,6 +1371,8 @@ struct MainView: View {
                     ClipInspector(store: store)
                 case .zoom:
                     ZoomInspector(store: store)
+                case .transition:
+                    TransitionInspector(store: store)
                 case .privacy:
                     PrivacyInspector(store: store)
                 case .annotation:
@@ -2595,6 +2805,18 @@ private struct ClipInspector: View {
     }
 
     var body: some View {
+        InspectorSection(title: "Smart editing") {
+            Button {
+                store.smartTrimSilence()
+            } label: {
+                Label("Smart trim", systemImage: "wand.and.stars")
+            }
+            .disabled(store.project.clips.isEmpty)
+            Text("Cuts silent footage from the start and end of the recording.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+
         if let clip = selectedClip {
             InspectorSection(title: "Selected clip") {
                 LabeledSlider(
@@ -2672,6 +2894,114 @@ private struct ClipInspector: View {
             Text("Select a clip on the timeline to change speed, volume, or trim.")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct TransitionInspector: View {
+    @ObservedObject var store: EditorStore
+
+    private var selectedTransition: ClipTransition? {
+        store.project.transitions.first {
+            $0.id == store.selectedTransitionID
+        }
+    }
+
+    var body: some View {
+        if let transition = selectedTransition {
+            InspectorSection(title: "Selected transition") {
+                templateGrid(selected: transition.style) { style in
+                    store.updateSelectedTransition(style: style)
+                }
+                LabeledSlider(
+                    title: "Duration",
+                    value: Binding(
+                        get: { transition.duration },
+                        set: { store.updateSelectedTransition(duration: $0) }
+                    ),
+                    range: 0.2...1.2,
+                    suffix: "s"
+                )
+                HStack {
+                    Button {
+                        store.previewTransition()
+                    } label: {
+                        Label("Preview", systemImage: "play.fill")
+                    }
+                    Spacer()
+                    Button(role: .destructive) {
+                        store.removeSelectedTransition()
+                    } label: {
+                        Label("Remove", systemImage: "trash")
+                    }
+                }
+                .buttonStyle(ToolbarButtonStyle())
+            }
+        } else {
+            InspectorSection(title: "Transition templates") {
+                templateGrid(selected: store.transitionStyle) { style in
+                    store.transitionStyle = style
+                }
+                Text(
+                    "Drag a template onto the cut between two clips, or tap a junction marker."
+                )
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                LabeledSlider(
+                    title: "Default duration",
+                    value: $store.transitionDuration,
+                    range: 0.2...1.2,
+                    suffix: "s"
+                )
+            }
+        }
+    }
+
+    private func templateGrid(
+        selected: ClipTransitionStyle,
+        onSelect: @escaping (ClipTransitionStyle) -> Void
+    ) -> some View {
+        LazyVGrid(
+            columns: [
+                GridItem(.flexible()),
+                GridItem(.flexible()),
+                GridItem(.flexible())
+            ],
+            spacing: 8
+        ) {
+            ForEach(ClipTransitionStyle.allCases) { style in
+                Button {
+                    onSelect(style)
+                } label: {
+                    VStack(spacing: 5) {
+                        Image(systemName: style.symbol)
+                            .font(.system(size: 16))
+                        Text(LocalizedStringKey(style.rawValue))
+                            .font(.system(size: 9, weight: .medium))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 9)
+                    .background(
+                        selected == style
+                            ? Color.accentColor.opacity(0.28)
+                            : Color.white.opacity(0.05),
+                        in: RoundedRectangle(cornerRadius: 9)
+                    )
+                    .overlay {
+                        if selected == style {
+                            RoundedRectangle(cornerRadius: 9)
+                                .stroke(Color.accentColor, lineWidth: 1.5)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                .draggable(style.rawValue)
+                .accessibilityIdentifier(
+                    "transition.template.\(style.rawValue)"
+                )
+            }
         }
     }
 }

@@ -844,3 +844,32 @@ final class TimelineProjectTests: XCTestCase {
         )
     }
 }
+
+final class TimelineClipEditedTests: XCTestCase {
+    func testPristineFullLengthClipIsNotEdited() {
+        let clip = TimelineClip(sourceStart: 0, duration: 10)
+        XCTAssertFalse(clip.isEdited(sourceDuration: 10))
+    }
+
+    func testTrimmedOrSplitClipIsEdited() {
+        XCTAssertTrue(
+            TimelineClip(sourceStart: 2, duration: 8)
+                .isEdited(sourceDuration: 10)
+        )
+        XCTAssertTrue(
+            TimelineClip(sourceStart: 0, duration: 4)
+                .isEdited(sourceDuration: 10)
+        )
+    }
+
+    func testSpeedOrVolumeChangeCountsAsEdited() {
+        XCTAssertTrue(
+            TimelineClip(sourceStart: 0, duration: 10, playbackRate: 1.5)
+                .isEdited(sourceDuration: 10)
+        )
+        XCTAssertTrue(
+            TimelineClip(sourceStart: 0, duration: 10, volume: 0.5)
+                .isEdited(sourceDuration: 10)
+        )
+    }
+}

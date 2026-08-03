@@ -1713,6 +1713,132 @@ final class VideoExporterTests: XCTestCase {
         }
     }
 
+    func testFadeTransitionDipsToBlackAtCut() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sourceURL = directory.appendingPathComponent("source.mp4")
+        try await makeSyntheticMedia(at: sourceURL)
+        let clips = [
+            TimelineClip(sourceStart: 0, duration: 0.5),
+            TimelineClip(sourceStart: 0.5, duration: 0.5)
+        ]
+        let project = TimelineProject(
+            clips: clips,
+            transitions: [
+                ClipTransition(
+                    leftClipID: clips[0].id,
+                    rightClipID: clips[1].id,
+                    style: .fade,
+                    duration: 0.4
+                )
+            ]
+        )
+        let exporter = VideoExporter()
+
+        let atCut = try await exporter.renderFrame(
+            sourceURL: sourceURL,
+            project: project,
+            timelineTime: 0.5,
+            canvasStyle: .plain,
+            frameRate: 30
+        )
+        let awayFromCut = try await exporter.renderFrame(
+            sourceURL: sourceURL,
+            project: project,
+            timelineTime: 0.1,
+            canvasStyle: .plain,
+            frameRate: 30
+        )
+
+        let cutLuma = averageLuma(atCut)
+        let normalLuma = averageLuma(awayFromCut)
+        XCTAssertGreaterThan(normalLuma, 20)
+        XCTAssertLessThan(cutLuma, normalLuma * 0.3)
+    }
+
+    func testZoomTransitionRendersAroundCutAlongsideRegularZoom() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sourceURL = directory.appendingPathComponent("source.mp4")
+        try await makeSyntheticMedia(at: sourceURL)
+        // A regular zoom overlapping the transition window exercises the
+        // merged transform-ramp path.
+        let clips = [
+            TimelineClip(sourceStart: 0, duration: 0.5),
+            TimelineClip(sourceStart: 0.5, duration: 0.5)
+        ]
+        let project = TimelineProject(
+            clips: clips,
+            zooms: [
+                ZoomEvent(
+                    start: 0.2,
+                    duration: 0.6,
+                    scale: 1.6,
+                    focusX: 0.5,
+                    focusY: 0.5
+                )
+            ],
+            transitions: [
+                ClipTransition(
+                    leftClipID: clips[0].id,
+                    rightClipID: clips[1].id,
+                    style: .zoom,
+                    duration: 0.4
+                )
+            ]
+        )
+        let exporter = VideoExporter()
+
+        for time in [0.05, 0.4, 0.5, 0.6, 0.95] {
+            let frame = try await exporter.renderFrame(
+                sourceURL: sourceURL,
+                project: project,
+                timelineTime: time,
+                canvasStyle: .plain,
+                frameRate: 30
+            )
+            XCTAssertGreaterThan(frame.width, 0)
+            XCTAssertGreaterThan(averageLuma(frame), 5)
+        }
+    }
+
+    private func averageLuma(_ image: CGImage) -> Double {
+        let ciImage = CIImage(cgImage: image)
+        guard let filter = CIFilter(
+            name: "CIAreaAverage",
+            parameters: [
+                kCIInputImageKey: ciImage,
+                kCIInputExtentKey: CIVector(cgRect: ciImage.extent)
+            ]
+        ), let output = filter.outputImage else {
+            return 0
+        }
+        var bitmap = [UInt8](repeating: 0, count: 4)
+        CIContext().render(
+            output,
+            toBitmap: &bitmap,
+            rowBytes: 4,
+            bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+            format: .RGBA8,
+            colorSpace: nil
+        )
+        return (
+            Double(bitmap[0]) + Double(bitmap[1]) + Double(bitmap[2])
+        ) / 3
+    }
+
     private func makeSyntheticMedia(at url: URL) async throws {
         let videoOnlyURL = url
             .deletingLastPathComponent()

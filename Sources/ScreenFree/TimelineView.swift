@@ -294,26 +294,48 @@ struct TimelineView: View {
                             .opacity(0.72)
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
-                                Label(
-                                    "\(index + 1)",
-                                    systemImage: "scissors"
-                                )
-                                    .font(.system(size: 11, weight: .semibold))
-                                    .accessibilityLabel(
-                                        Text(
-                                            L10n.text(
-                                                "Edited clip %d",
-                                                language: store.appLanguage,
-                                                index + 1
+                                HStack(spacing: 4) {
+                                    Label(
+                                        "\(index + 1)",
+                                        systemImage: "scissors"
+                                    )
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .accessibilityLabel(
+                                            Text(
+                                                L10n.text(
+                                                    "Edited clip %d",
+                                                    language: store.appLanguage,
+                                                    index + 1
+                                                )
                                             )
                                         )
-                                    )
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(
-                                        .black.opacity(0.2),
-                                        in: Capsule()
-                                    )
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(
+                                            .black.opacity(0.2),
+                                            in: Capsule()
+                                        )
+                                    if clip.isEdited(
+                                        sourceDuration: store.sourceDuration
+                                    ) {
+                                        Label(
+                                            L10n.text(
+                                                "Edited",
+                                                language: store.appLanguage
+                                            ),
+                                            systemImage: "pencil"
+                                        )
+                                            .font(
+                                                .system(size: 9, weight: .bold)
+                                            )
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(
+                                                Color.purple.opacity(0.85),
+                                                in: Capsule()
+                                            )
+                                    }
+                                }
                                 Text(
                                     "\(clip.timelineDuration, specifier: "%.1f")s · \(clip.playbackRate, specifier: "%.1f")×"
                                 )
@@ -321,7 +343,7 @@ struct TimelineView: View {
                                     .opacity(0.78)
                             }
                             Spacer()
-                            if selected, clipWidth >= 150 {
+                            if selected, clipWidth >= 120 {
                                 HStack(spacing: 4) {
                                     Button {
                                         store.trimSelected(start: true)
@@ -332,11 +354,6 @@ struct TimelineView: View {
                                         store.trimSelected(start: false)
                                     } label: {
                                         Image(systemName: "arrow.left.to.line.compact")
-                                    }
-                                    Button {
-                                        store.deleteSelectedClip()
-                                    } label: {
-                                        Image(systemName: "trash")
                                     }
                                 }
                                 .buttonStyle(.plain)
@@ -476,6 +493,22 @@ struct TimelineView: View {
                     }
                 }
 
+                // Transition markers on the cuts between adjacent clips.
+                ForEach(
+                    Array(store.project.transitionJunctions().enumerated()),
+                    id: \.element.leftClipID
+                ) { _, junction in
+                    transitionMarker(
+                        junction: junction,
+                        x: scale.x(
+                            forTime: junction.time,
+                            duration: duration,
+                            contentWidth: width
+                        ),
+                        pxPerSecond: width / max(0.01, CGFloat(duration))
+                    )
+                }
+
                 if store.activeTimelineTool == .split {
                     Color.clear
                         .contentShape(Rectangle())
@@ -542,6 +575,95 @@ struct TimelineView: View {
         return String(format: "%.2f×", rate)
     }
 
+    /// CapCut-style marker on a clip junction: a faint plus badge when the
+    /// cut is empty (tap applies the current template, or drop a dragged
+    /// template here), or a filled badge showing the placed transition.
+    private func transitionMarker(
+        junction: TransitionJunction,
+        x: CGFloat,
+        pxPerSecond: CGFloat
+    ) -> some View {
+        let transition = junction.transition
+        let isSelected = transition?.id == store.selectedTransitionID
+        let markerWidth: CGFloat = transition.map {
+            max(22, min(64, CGFloat($0.duration) * pxPerSecond))
+        } ?? 14
+
+        return Group {
+            if let transition {
+                Image(systemName: transition.style.symbol)
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(
+                        isSelected
+                            ? Color.accentColor : Color.black.opacity(0.75)
+                    )
+                    .frame(width: markerWidth, height: 16)
+                    .background(
+                        Capsule().fill(
+                            isSelected
+                                ? Color.accentColor.opacity(0.25)
+                                : Color.white.opacity(0.88)
+                        )
+                    )
+                    .overlay(
+                        Capsule().stroke(
+                            isSelected
+                                ? Color.accentColor
+                                : Color.black.opacity(0.35),
+                            lineWidth: isSelected ? 1.5 : 0.5
+                        )
+                    )
+            } else {
+                Image(systemName: "plus")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.9))
+                    .frame(width: 14, height: 14)
+                    .background(Circle().fill(Color.black.opacity(0.55)))
+                    .overlay(
+                        Circle().stroke(
+                            Color.white.opacity(0.5),
+                            lineWidth: 0.5
+                        )
+                    )
+            }
+        }
+        .contentShape(Rectangle())
+        .offset(x: x - markerWidth / 2)
+        .onTapGesture {
+            if let transition {
+                store.selectedTransitionID = transition.id
+                store.inspectorPanel = .transition
+            } else {
+                store.applyTransition(
+                    store.transitionStyle,
+                    toJunction: junction
+                )
+            }
+        }
+        .dropDestination(for: String.self) { payloads, _ in
+            guard let raw = payloads.first,
+                  let style = ClipTransitionStyle(rawValue: raw) else {
+                return false
+            }
+            store.applyTransition(style, toJunction: junction)
+            return true
+        }
+        .contextMenu {
+            if transition != nil {
+                Button(role: .destructive) {
+                    store.selectedTransitionID = transition?.id
+                    store.removeSelectedTransition()
+                } label: {
+                    Label("Remove transition", systemImage: "trash")
+                }
+            }
+        }
+        .accessibilityIdentifier(
+            "timeline.transition.\(junction.leftClipID.uuidString)"
+        )
+        .zIndex(5)
+    }
+
     private func waveform(for clip: TimelineClip) -> some View {
         GeometryReader { geometry in
             Path { path in
@@ -567,7 +689,7 @@ struct TimelineView: View {
                     )
                 }
             }
-            .stroke(.white, style: StrokeStyle(lineWidth: 1.25, lineCap: .round))
+            .stroke(.white, style: StrokeStyle(lineWidth: 1, lineCap: .round))
         }
     }
 
@@ -1504,5 +1626,16 @@ private struct RedactionRangeBar: View {
                     NSCursor.pop()
                 }
             }
+    }
+}
+
+extension ClipTransitionStyle {
+    /// SF Symbol used for template cards and timeline junction badges.
+    var symbol: String {
+        switch self {
+        case .fade: return "circle.fill"
+        case .flash: return "sun.max.fill"
+        case .zoom: return "arrow.up.left.and.arrow.down.right"
+        }
     }
 }

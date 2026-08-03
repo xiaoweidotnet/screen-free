@@ -115,7 +115,7 @@ struct AudioAnalyzer: Sendable {
         var peakEnvelope: [Float]
     }
 
-    func analyze(url: URL, bins: Int = 512) async throws -> AudioAnalysis {
+    func analyze(url: URL, bins: Int = 2048) async throws -> AudioAnalysis {
         try await Task.detached(priority: .utility) {
             try await analyzeSynchronously(url: url, bins: bins)
         }.value

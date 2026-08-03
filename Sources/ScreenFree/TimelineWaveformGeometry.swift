@@ -32,9 +32,11 @@ enum TimelineWaveformGeometry {
             return []
         }
 
+        // One bar every 2 points keeps the waveform fine-grained enough to
+        // read like a real amplitude envelope instead of a coarse histogram.
         let barCount = min(
-            90,
-            max(1, Int(canvasSize.width / 5))
+            600,
+            max(1, Int(canvasSize.width / 2))
         )
         return (0..<barCount).compactMap { barIndex in
             let lowerProgress = Double(barIndex) / Double(barCount)
@@ -75,15 +77,17 @@ enum TimelineWaveformGeometry {
             }
             guard level > 0 else { return nil }
 
+            // Keep the bar height proportional to the (already
+            // loudness-compensated) sample level so loud passages read tall
+            // and quiet passages read low.
             let normalizedLevel = CGFloat(level.clamped(to: 0...1))
-            let visibleLevel = pow(normalizedLevel, 0.72)
             return TimelineWaveformBar(
                 x: canvasSize.width
                     * (CGFloat(barIndex) + 0.5)
                     / CGFloat(barCount),
                 halfHeight: max(
-                    0.75,
-                    visibleLevel * canvasSize.height * 0.45
+                    0.5,
+                    normalizedLevel * canvasSize.height * 0.45
                 )
             )
         }

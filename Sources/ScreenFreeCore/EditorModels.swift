@@ -27,6 +27,21 @@ public struct TimelineClip: Identifiable, Equatable, Codable, Sendable {
     public var timelineDuration: TimeInterval {
         duration / max(0.01, playbackRate)
     }
+
+    /// Whether the clip deviates from a pristine full-length source clip,
+    /// i.e. it was trimmed, produced by a split, speed-changed, or
+    /// volume-adjusted.
+    public func isEdited(sourceDuration: TimeInterval) -> Bool {
+        let epsilon = 0.000_1
+        if sourceStart > epsilon { return true }
+        if sourceDuration.isFinite, sourceDuration > 0,
+           sourceEnd < sourceDuration - epsilon {
+            return true
+        }
+        if abs(playbackRate - 1) > epsilon { return true }
+        if abs(volume - 1) > epsilon { return true }
+        return false
+    }
 }
 
 public struct CursorSample: Identifiable, Equatable, Codable, Sendable {
@@ -265,6 +280,7 @@ public struct TimelineProject: Equatable, Codable, Sendable {
     public var shortcuts: [ShortcutEvent]
     public var redactions: [PrivacyRedaction]
     public var annotations: [EmphasisAnnotation]
+    public var transitions: [ClipTransition]
 
     public init(
         clips: [TimelineClip] = [],
@@ -274,7 +290,8 @@ public struct TimelineProject: Equatable, Codable, Sendable {
         captions: [CaptionCue] = [],
         shortcuts: [ShortcutEvent] = [],
         redactions: [PrivacyRedaction] = [],
-        annotations: [EmphasisAnnotation] = []
+        annotations: [EmphasisAnnotation] = [],
+        transitions: [ClipTransition] = []
     ) {
         self.clips = clips
         self.zooms = zooms
@@ -284,6 +301,7 @@ public struct TimelineProject: Equatable, Codable, Sendable {
         self.shortcuts = shortcuts
         self.redactions = redactions
         self.annotations = annotations
+        self.transitions = transitions
         normalizeZoomRanges()
     }
 
@@ -296,6 +314,7 @@ public struct TimelineProject: Equatable, Codable, Sendable {
         case shortcuts
         case redactions
         case annotations
+        case transitions
     }
 
     public init(from decoder: Decoder) throws {
@@ -332,6 +351,10 @@ public struct TimelineProject: Equatable, Codable, Sendable {
             [EmphasisAnnotation].self,
             forKey: .annotations
         ) ?? []
+        transitions = try container.decodeIfPresent(
+            [ClipTransition].self,
+            forKey: .transitions
+        ) ?? []
         normalizeZoomRanges()
     }
 
@@ -345,6 +368,7 @@ public struct TimelineProject: Equatable, Codable, Sendable {
         try container.encode(shortcuts, forKey: .shortcuts)
         try container.encode(redactions, forKey: .redactions)
         try container.encode(annotations, forKey: .annotations)
+        try container.encode(transitions, forKey: .transitions)
     }
 
     public var duration: TimeInterval {
@@ -409,9 +433,11 @@ public struct TimelineProject: Equatable, Codable, Sendable {
             zooms.removeAll()
             redactions.removeAll()
             annotations.removeAll()
+            transitions.removeAll()
             return
         }
         normalizeZoomRanges()
+        pruneTransitions()
         redactions.removeAll { $0.start >= timelineDuration }
         for index in redactions.indices {
             redactions[index].start = redactions[index].start.clamped(

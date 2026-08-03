@@ -1305,6 +1305,9 @@ struct VideoExporter {
         }
         .sorted { $0.time < $1.time }
 
+        let dipJunctions = project.transitionJunctions().filter {
+            $0.transition?.style == .fade || $0.transition?.style == .flash
+        }
         let needsCanvas = style.padding > 0 || style.cornerRadius > 0
         guard needsCanvas
             || !timelineCursorSamples.isEmpty
@@ -1313,6 +1316,7 @@ struct VideoExporter {
             || (style.showCaptions && !project.captions.isEmpty)
             || !project.redactions.isEmpty
             || !project.annotations.isEmpty
+            || !dipJunctions.isEmpty
             || style.motionBlur.enabled else {
             return
         }
@@ -1442,6 +1446,16 @@ struct VideoExporter {
             )
         }
 
+        for junction in dipJunctions {
+            addTransitionDip(
+                junction: junction,
+                project: project,
+                to: parentLayer,
+                videoFrame: videoLayer.frame,
+                cornerRadius: style.cornerRadius
+            )
+        }
+
         addPrivacyRedactions(
             project.redactions,
             to: parentLayer,
@@ -1474,6 +1488,57 @@ struct VideoExporter {
             postProcessingAsVideoLayer: videoLayer,
             in: parentLayer
         )
+    }
+
+    private func addTransitionDip(
+        junction: TransitionJunction,
+        project: TimelineProject,
+        to parentLayer: CALayer,
+        videoFrame: CGRect,
+        cornerRadius: CGFloat
+    ) {
+        guard let transition = junction.transition else { return }
+        let totalDuration = project.duration
+        let half = transition.duration / 2
+        let start = max(0, junction.time - half)
+        let end = min(totalDuration, junction.time + half)
+        guard end - start > 0.001 else { return }
+
+        let junctions = project.transitionJunctions()
+        let steps = max(2, Int(ceil((end - start) * 60)))
+        var values: [Double] = []
+        var keyTimes: [NSNumber] = []
+        for step in 0...steps {
+            let progress = Double(step) / Double(steps)
+            let time = start + (end - start) * progress
+            values.append(
+                ClipTransitionResolver.frame(
+                    junctions: junctions,
+                    at: time
+                ).dipOpacity
+            )
+            keyTimes.append(NSNumber(value: progress))
+        }
+
+        let dipLayer = CALayer()
+        dipLayer.frame = videoFrame
+        dipLayer.cornerRadius = cornerRadius
+        dipLayer.masksToBounds = true
+        dipLayer.backgroundColor = (
+            transition.style.dipsToWhite ? NSColor.white : NSColor.black
+        ).cgColor
+        dipLayer.opacity = 0
+
+        let animation = CAKeyframeAnimation(keyPath: "opacity")
+        animation.values = values
+        animation.keyTimes = keyTimes
+        animation.duration = end - start
+        animation.beginTime = AVCoreAnimationBeginTimeAtZero + start
+        animation.isRemovedOnCompletion = false
+        animation.fillMode = .forwards
+        dipLayer.add(animation, forKey: "transitionDip")
+
+        parentLayer.addSublayer(dipLayer)
     }
 
     private func addPrivacyRedactions(
@@ -2230,12 +2295,29 @@ struct VideoExporter {
             Double(motion.exportSampleCount)
                 / max(0.08, motion.transitionDuration)
         )
-        let boundaries = zooms.flatMap { [$0.start, $0.end] }
+        var boundaries = zooms.flatMap { [$0.start, $0.end] }
 
-        for activeRange in ZoomMotionResolver.activeRanges(
+        var activeRanges = ZoomMotionResolver.activeRanges(
             zooms: zooms,
             totalDuration: totalDuration
-        ) {
+        )
+        let zoomTransitionJunctions = project.transitionJunctions().filter {
+            $0.transition?.style == .zoom
+        }
+        if !zoomTransitionJunctions.isEmpty {
+            // Zoom-punch transition windows are sampled into the same dense
+            // transform ramps; ranges are merged so ramps never overlap.
+            activeRanges += zoomTransitionJunctions.map { junction in
+                let half = (junction.transition?.duration ?? 0.4) / 2
+                let lower = max(0, junction.time - half)
+                let upper = min(totalDuration, junction.time + half)
+                return lower...upper
+            }
+            boundaries += zoomTransitionJunctions.map(\.time)
+            activeRanges = mergedRanges(activeRanges)
+        }
+
+        for activeRange in activeRanges {
             let duration = activeRange.upperBound - activeRange.lowerBound
             guard duration > 0 else { continue }
             let steps = max(
@@ -2308,6 +2390,22 @@ struct VideoExporter {
         }
     }
 
+    private func mergedRanges(
+        _ ranges: [ClosedRange<TimeInterval>]
+    ) -> [ClosedRange<TimeInterval>] {
+        var result: [ClosedRange<TimeInterval>] = []
+        for range in ranges.sorted(by: { $0.lowerBound < $1.lowerBound }) {
+            if let last = result.last,
+               range.lowerBound <= last.upperBound + 0.000_001 {
+                result[result.count - 1] =
+                    last.lowerBound...max(last.upperBound, range.upperBound)
+            } else {
+                result.append(range)
+            }
+        }
+        return result
+    }
+
     private func transform(
         for resolved: ResolvedZoomMotion?,
         time: TimeInterval,
@@ -2316,28 +2414,48 @@ struct VideoExporter {
         project: TimelineProject,
         style: CanvasRenderStyle
     ) -> CGAffineTransform {
-        guard let resolved else { return baseTransform }
-        let resolvedFocus = resolved.zoom.resolvedFollowsCursor
-            ? resolvedZoomFocus(
-                resolved.zoom,
-                at: time,
-                project: project,
-                style: style
+        var result = baseTransform
+        if let resolved {
+            let resolvedFocus = resolved.zoom.resolvedFollowsCursor
+                ? resolvedZoomFocus(
+                    resolved.zoom,
+                    at: time,
+                    project: project,
+                    style: style
+                )
+                : CGPoint(x: resolved.focusX, y: resolved.focusY)
+            let normalizedFocus = cropGeometry.clampedNormalizedOutputPoint(
+                x: resolvedFocus.x,
+                y: resolvedFocus.y
             )
-            : CGPoint(x: resolved.focusX, y: resolved.focusY)
-        let normalizedFocus = cropGeometry.clampedNormalizedOutputPoint(
-            x: resolvedFocus.x,
-            y: resolvedFocus.y
-        )
-        let focus = CGPoint(
-            x: cropGeometry.renderSize.width * normalizedFocus.x,
-            y: cropGeometry.renderSize.height * normalizedFocus.y
-        )
-        let scale = resolved.scale
-        let focusZoom = CGAffineTransform(translationX: focus.x, y: focus.y)
-            .scaledBy(x: scale, y: scale)
-            .translatedBy(x: -focus.x, y: -focus.y)
-        return baseTransform.concatenating(focusZoom)
+            let focus = CGPoint(
+                x: cropGeometry.renderSize.width * normalizedFocus.x,
+                y: cropGeometry.renderSize.height * normalizedFocus.y
+            )
+            let scale = resolved.scale
+            let focusZoom = CGAffineTransform(translationX: focus.x, y: focus.y)
+                .scaledBy(x: scale, y: scale)
+                .translatedBy(x: -focus.x, y: -focus.y)
+            result = result.concatenating(focusZoom)
+        }
+        let transitionScale = ClipTransitionResolver.frame(
+            junctions: project.transitionJunctions(),
+            at: time
+        ).contentScale
+        if abs(transitionScale - 1) > 0.000_1 {
+            let center = CGPoint(
+                x: cropGeometry.renderSize.width / 2,
+                y: cropGeometry.renderSize.height / 2
+            )
+            let punch = CGAffineTransform(
+                translationX: center.x,
+                y: center.y
+            )
+                .scaledBy(x: transitionScale, y: transitionScale)
+                .translatedBy(x: -center.x, y: -center.y)
+            result = result.concatenating(punch)
+        }
+        return result
     }
 }
 

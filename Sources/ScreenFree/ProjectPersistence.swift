@@ -59,6 +59,8 @@ struct ScreenFreeProjectSnapshot: Codable {
     var cameraCornerRadius: Double
     var cameraMirrored: Bool
     var cameraPosition: CameraPosition
+    var transitionStyle: ClipTransitionStyle? = nil
+    var transitionDuration: Double? = nil
     var updatedAt: Date
 }
 

@@ -76,4 +76,23 @@ struct RecordingHistoryCatalog {
         .prefix(max(0, limit))
         .map(\.self)
     }
+
+    /// Permanently removes the given recordings from disk. Only files that
+    /// live directly inside the catalog directory are deleted; anything else
+    /// is skipped. Returns the number of files actually removed.
+    @discardableResult
+    func delete(_ items: [RecordingHistoryItem]) -> Int {
+        let directoryPath = directory.standardizedFileURL.path
+        var deleted = 0
+        for item in items {
+            let url = item.url.standardizedFileURL
+            guard url.deletingLastPathComponent().path == directoryPath else {
+                continue
+            }
+            if (try? fileManager.removeItem(at: url)) != nil {
+                deleted += 1
+            }
+        }
+        return deleted
+    }
 }
