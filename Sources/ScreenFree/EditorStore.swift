@@ -582,7 +582,7 @@ final class EditorStore: ObservableObject {
             try recordingWindowCoordinator.present(
                 onDisplayID: selectedTargetID,
                 hideDockIcon: hideDockIconWhileRecording,
-                hideDesktopIcons: hideDesktopIconsWhileRecording
+                hideDesktopIcons: effectiveHideDesktopIconsWhileRecording
             )
             if countdownSeconds > 0 {
                 for remaining in stride(from: countdownSeconds, through: 1, by: -1) {
@@ -640,6 +640,14 @@ final class EditorStore: ObservableObject {
             activeRecordingAudioLayout = nil
             errorMessage = error.localizedDescription
         }
+    }
+
+    private var effectiveHideDesktopIconsWhileRecording: Bool {
+        #if APP_STORE
+            false
+        #else
+            hideDesktopIconsWhileRecording
+        #endif
     }
 
     func stopRecording() async {

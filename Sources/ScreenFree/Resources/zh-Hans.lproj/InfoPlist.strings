@@ -1,0 +1,5 @@
+"CFBundleDisplayName" = "ScreenFree";
+"NSCameraUsageDescription" = "启用摄像头后，ScreenFree 会将摄像头画面叠加到屏幕录制中。";
+"NSMicrophoneUsageDescription" = "启用麦克风后，ScreenFree 会在录制屏幕的同时录制你的声音。";
+"NSScreenCaptureUsageDescription" = "ScreenFree 会录制你选择的显示器、窗口或屏幕区域。";
+"NSSpeechRecognitionUsageDescription" = "ScreenFree 会在这台 Mac 上转写录制内容，以生成可编辑字幕。";

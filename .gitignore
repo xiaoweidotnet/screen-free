@@ -6,3 +6,4 @@ dist/
 *.mp4
 .DS_Store
 
+AppStore/Build/

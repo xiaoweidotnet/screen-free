@@ -1,0 +1,5 @@
+"CFBundleDisplayName" = "ScreenFree";
+"NSCameraUsageDescription" = "ScreenFree places your camera over a screen recording when you enable the camera.";
+"NSMicrophoneUsageDescription" = "ScreenFree records your voice with the screen when you enable the microphone.";
+"NSScreenCaptureUsageDescription" = "ScreenFree records the display, window, or area you choose.";
+"NSSpeechRecognitionUsageDescription" = "ScreenFree transcribes your recording on this Mac to create editable captions.";

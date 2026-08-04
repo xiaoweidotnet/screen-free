@@ -40,8 +40,20 @@ enum DesktopIconPresentationError: LocalizedError {
     }
 }
 
-@MainActor
-final class FinderDesktopIconController {
+#if APP_STORE
+    @MainActor
+    final class FinderDesktopIconController {
+        init(defaults _: UserDefaults = .standard) {}
+
+        func recoverIfNeeded() {}
+
+        func begin(hideDesktopIcons _: Bool) throws {}
+
+        func finish() {}
+    }
+#else
+    @MainActor
+    final class FinderDesktopIconController {
     private static let finderBundleID = "com.apple.finder"
     private static let finderPreferenceKey = "CreateDesktop"
     private static let recoveryKey = "desktopIconRecoverySnapshot"
@@ -149,4 +161,5 @@ final class FinderDesktopIconController {
             withBundleIdentifier: Self.finderBundleID
         ).forEach { _ = $0.terminate() }
     }
-}
+    }
+#endif

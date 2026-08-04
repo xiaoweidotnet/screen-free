@@ -1735,15 +1735,17 @@ private struct RecordingInspector: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
 
-            Toggle(
-                "Hide desktop icons while recording",
-                isOn: $store.hideDesktopIconsWhileRecording
-            )
-            .toggleStyle(.switch)
+            #if !APP_STORE
+                Toggle(
+                    "Hide desktop icons while recording",
+                    isOn: $store.hideDesktopIconsWhileRecording
+                )
+                .toggleStyle(.switch)
 
-            Text("Finder refreshes when recording starts and the exact prior desktop setting is restored afterward.")
-                .font(.system(size: 11))
-                .foregroundStyle(.tertiary)
+                Text("Finder refreshes when recording starts and the exact prior desktop setting is restored afterward.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+            #endif
 
             Toggle(
                 "Show speaker notes while recording",

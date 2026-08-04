@@ -34,6 +34,12 @@ for LOCALIZATION_DIR in "$ROOT_DIR"/Sources/ScreenFree/Resources/*.lproj; do
     cp -R "$LOCALIZATION_DIR" "$APP_RESOURCES/"
   fi
 done
+if [[ -f "$ROOT_DIR/Sources/ScreenFree/Resources/ScreenFree.icns" ]]; then
+  cp "$ROOT_DIR/Sources/ScreenFree/Resources/ScreenFree.icns" "$APP_RESOURCES/"
+fi
+if [[ -f "$ROOT_DIR/Sources/ScreenFree/Resources/PrivacyInfo.xcprivacy" ]]; then
+  cp "$ROOT_DIR/Sources/ScreenFree/Resources/PrivacyInfo.xcprivacy" "$APP_RESOURCES/"
+fi
 
 cat >"$INFO_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -54,6 +60,10 @@ cat >"$INFO_PLIST" <<PLIST
   <string>1</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>CFBundleIconFile</key>
+  <string>ScreenFree.icns</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.video</string>
   <key>CFBundleDocumentTypes</key>
   <array>
     <dict>
@@ -105,6 +115,10 @@ cat >"$INFO_PLIST" <<PLIST
   <string>$MIN_SYSTEM_VERSION</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>ITSAppUsesNonExemptEncryption</key>
+  <false/>
   <key>NSScreenCaptureUsageDescription</key>
   <string>ScreenFree records the display or window you choose.</string>
   <key>NSMicrophoneUsageDescription</key>
