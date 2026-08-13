@@ -42,7 +42,8 @@ struct ExportSheet: View {
         }
         .padding(30)
         .frame(width: 940)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(StudioTheme.canvas)
+        .tint(StudioTheme.accent)
         .interactiveDismissDisabled(store.isVideoExporting)
         .onChange(of: store.exportFormat) { _, format in
             store.exportFrameRate = ExportFrameRateOptions.normalized(
@@ -347,13 +348,13 @@ private struct ExportChoiceButton: View {
                 RoundedRectangle(cornerRadius: 11)
                     .fill(
                         isSelected
-                            ? Color.indigo.opacity(0.26)
-                            : Color.white.opacity(0.04)
+                            ? StudioTheme.accentMuted
+                            : StudioTheme.raisedSurface
                     )
                     .stroke(
                         isSelected
-                            ? Color.purple.opacity(0.75)
-                            : Color.white.opacity(0.06),
+                            ? StudioTheme.accent
+                            : StudioTheme.border.opacity(0.58),
                         lineWidth: isSelected ? 1.5 : 1
                     )
             }
@@ -377,7 +378,7 @@ private struct ExportFooterButtonStyle: ButtonStyle {
                 RoundedRectangle(cornerRadius: 10)
                     .fill(
                         isPrimary
-                            ? Color.indigo.opacity(
+                            ? StudioTheme.accent.opacity(
                                 configuration.isPressed ? 0.72 : 1
                             )
                             : Color.white.opacity(
@@ -387,5 +388,7 @@ private struct ExportFooterButtonStyle: ButtonStyle {
                     .stroke(.white.opacity(0.08), lineWidth: 1)
             }
             .opacity(configuration.isPressed ? 0.88 : 1)
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }

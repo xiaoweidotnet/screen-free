@@ -1,0 +1,9 @@
+schema_version: 1
+module_path: screenfree_app
+title: ScreenFree macOS 屏幕录制应用
+scope:
+    - Sources/ScreenFree/
+source_files: []
+depends_on: []
+related_to:
+    - path: scripts

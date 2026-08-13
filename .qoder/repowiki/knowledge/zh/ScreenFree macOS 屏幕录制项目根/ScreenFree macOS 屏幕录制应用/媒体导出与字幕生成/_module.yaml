@@ -1,0 +1,13 @@
+schema_version: 1
+module_path: screenfree_app/media_processing
+title: 媒体导出与字幕生成
+scope:
+    - Sources/ScreenFree/CaptionGenerator.swift
+    - Sources/ScreenFree/OriginalMediaExporter.swift
+    - Sources/ScreenFree/VideoExporter.swift
+    - Sources/ScreenFree/RoundedCameraVideoCompositor.swift
+source_files: []
+depends_on: []
+related_to:
+    - path: screenfree_app/recording_engine
+    - path: tests

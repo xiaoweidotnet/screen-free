@@ -86,7 +86,9 @@ implemented in SwiftUI, AppKit, ScreenCaptureKit, and AVFoundation.
 - Save/open versioned `.screenfree` project files and autosave crash-recovery
   state without reopening stale media on a normal launch. A recording-history
   browser scans ScreenFree's Movies folder and reopens earlier captures for
-  another editing pass.
+  another editing pass. New ScreenFree recordings keep an adjacent versioned
+  project sidecar, so reopening a capture restores its editable cursor path,
+  click events, zooms, and style instead of loading only the cursor-free MP4.
 - Switch between English, Simplified Chinese, and the system language without
   restarting.
 - Run `Studio Check` before recording to verify screen access, automatic-click
@@ -107,7 +109,7 @@ The development bundle is assembled at `dist/ScreenFree.app`.
   is enabled. Native microphone capture in recordings requires macOS 15 or
   later; the editor and system-audio recorder still run on macOS 14.
 - **Camera** is required only when a camera is selected.
-- **Input Monitoring** is required for automatic click-triggered zooms. Manual
+- **Input Monitoring** is required for automatic long-right-hold zooms. Manual
   zooms and the editable cursor path still work without it.
 - **Speech Recognition** is requested only when generating captions.
 

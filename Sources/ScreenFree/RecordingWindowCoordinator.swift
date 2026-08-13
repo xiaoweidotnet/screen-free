@@ -421,11 +421,7 @@ private struct RecordingCountdownView: View {
                 .overlay {
                     Circle()
                         .stroke(
-                            LinearGradient(
-                                colors: [.purple, .pink, .orange],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            ),
+                            StudioTheme.accentGradient,
                             lineWidth: 7
                         )
                 }
@@ -524,11 +520,7 @@ private struct RecordingControlView: View {
                     .frame(height: 34)
                     .foregroundStyle(.white)
                     .background(
-                        LinearGradient(
-                            colors: [.red, .orange],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        ),
+                        StudioTheme.recordGradient,
                         in: RoundedRectangle(cornerRadius: 10)
                     )
             }

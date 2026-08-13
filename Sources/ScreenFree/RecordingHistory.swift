@@ -14,6 +14,17 @@ struct RecordingHistoryItem: Identifiable, Equatable, Sendable {
     }
 }
 
+enum RecordingProjectSidecar {
+    static func url(for recordingURL: URL) -> URL {
+        recordingURL.deletingPathExtension()
+            .appendingPathExtension("screenfree")
+    }
+
+    static func backupURL(for recordingURL: URL) -> URL {
+        url(for: recordingURL).appendingPathExtension("previous")
+    }
+}
+
 struct RecordingHistoryCatalog {
     let directory: URL
     private let fileManager: FileManager
@@ -90,6 +101,14 @@ struct RecordingHistoryCatalog {
                 continue
             }
             if (try? fileManager.removeItem(at: url)) != nil {
+                let sidecarURL = RecordingProjectSidecar.url(for: url)
+                if fileManager.fileExists(atPath: sidecarURL.path) {
+                    try? fileManager.removeItem(at: sidecarURL)
+                }
+                let backupURL = RecordingProjectSidecar.backupURL(for: url)
+                if fileManager.fileExists(atPath: backupURL.path) {
+                    try? fileManager.removeItem(at: backupURL)
+                }
                 deleted += 1
             }
         }

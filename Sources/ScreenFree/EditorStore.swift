@@ -27,11 +27,33 @@ enum AudioBackgroundError: LocalizedError {
     }
 }
 
+struct TimelineThumbnailFrame: Identifiable {
+    let id: Int
+    let sourceTime: TimeInterval
+    let image: NSImage
+}
+
+enum CursorCaptureGate {
+    static func allows(
+        callbackSessionID: UUID,
+        activeSessionID: UUID?,
+        isRecording: Bool,
+        isPaused: Bool,
+        isTransitioning: Bool
+    ) -> Bool {
+        callbackSessionID == activeSessionID
+            && isRecording
+            && !isPaused
+            && !isTransitioning
+    }
+}
+
 @MainActor
 final class EditorStore: ObservableObject {
     enum TimelineEditTool: Equatable {
         case selection
         case split
+        case redaction
         case annotation(EmphasisAnnotationKind)
     }
 
@@ -258,6 +280,7 @@ final class EditorStore: ObservableObject {
     @Published var exportQuality: ExportQuality = .studio
     @Published var exportFrameRate = 60
     @Published var audioAnalysis: AudioAnalysis = .empty
+    @Published private(set) var timelineThumbnails: [TimelineThumbnailFrame] = []
     @Published var backgroundMusicURL: URL?
     @Published var backgroundMusicVolume: Double = 0.2 {
         didSet {
@@ -350,15 +373,16 @@ final class EditorStore: ObservableObject {
     private let exporter = VideoExporter()
     private let audioAnalyzer = AudioAnalyzer()
     private let captionGenerator = CaptionGenerator()
-    private let persistence = ProjectPersistence()
+    private let persistence: ProjectPersistence
     private let segmentMerger = RecordingSegmentMerger()
     private let videoPasteboardWriter = VideoPasteboardWriter()
     private let originalRecordingDelivery = OriginalRecordingDelivery()
     private let originalMediaExporter = OriginalMediaExporter()
     private let stylePresetPersistence = StylePresetPersistence()
-    private let recordingHistoryCatalog = RecordingHistoryCatalog()
+    private let recordingHistoryCatalog: RecordingHistoryCatalog
     private var timeObserver: Any?
     private var cursorTimer: Timer?
+    private var activeCursorCaptureSessionID: UUID?
     private var globalClickMonitor: Any?
     private var globalKeyMonitor: Any?
     private var pendingRightClickID: UUID?
@@ -369,6 +393,8 @@ final class EditorStore: ObservableObject {
     private var activeRecordingAudioLayout: RecordedAudioLayout?
     private var recordingElapsedTimer: Timer?
     private var exportTask: Task<Void, Never>?
+    private var timelineThumbnailTask: Task<Void, Never>?
+    private var timelineThumbnailGeneration = UUID()
     private var activeSharingPicker: NSSharingServicePicker?
     private var audioMixRefreshGeneration = 0
     private var cancellables: Set<AnyCancellable> = []
@@ -377,7 +403,13 @@ final class EditorStore: ObservableObject {
     private var timelineRedoStack: [TimelineHistoryEntry] = []
     private var activeTimelineContinuousEdit: ActiveTimelineContinuousEdit?
 
-    init() {
+    init(
+        recordingHistoryCatalog: RecordingHistoryCatalog =
+            RecordingHistoryCatalog(),
+        persistence: ProjectPersistence = ProjectPersistence()
+    ) {
+        self.recordingHistoryCatalog = recordingHistoryCatalog
+        self.persistence = persistence
         let storedLanguage = UserDefaults.standard.string(forKey: "appLanguage")
         appLanguage = AppLanguage(rawValue: storedLanguage ?? "") ?? .system
         reduceMicrophoneNoise = UserDefaults.standard.object(
@@ -451,7 +483,15 @@ final class EditorStore: ObservableObject {
     }
 
     func applicationWillTerminate() {
+        pausePreviewPlayback()
         recordingWindowCoordinator.restoreDesktopIconsForTermination()
+    }
+
+    /// A `WindowGroup` can outlive its last visible window. Stop every preview
+    /// player explicitly so closing the editor cannot leave audio running in
+    /// the still-alive application process.
+    func editorWindowDidClose() {
+        pausePreviewPlayback()
     }
 
     func refreshCaptureTargets() async {
@@ -672,6 +712,13 @@ final class EditorStore: ObservableObject {
                 recordingSegments,
                 fileExtension: "mp4"
             )
+            let recordedInteractions = RecordingInteractionArchive(
+                project: project
+            )
+            try await RecordingInteractionMetadata.write(
+                recordedInteractions,
+                to: url
+            )
             refreshRecordingHistory()
             let recordedCameraURL = afterRecordingAction == .edit
                 && !cameraRecordingSegments.isEmpty
@@ -686,7 +733,10 @@ final class EditorStore: ObservableObject {
             switch afterRecordingAction {
             case .edit:
                 statusMessage = "Recording saved. Preparing the timeline…"
-                try await loadVideo(url)
+                try await loadVideo(
+                    url,
+                    preservingCapturedMetadata: true
+                )
                 cameraURL = recordedCameraURL
                 recordedAudioLayout = activeRecordingAudioLayout
                 refreshSourceAudioMix()
@@ -706,6 +756,7 @@ final class EditorStore: ObservableObject {
                     )
                     selectedZoomID = project.zooms.first?.id
                 }
+                try saveRecordingProjectSidecarIfNeeded()
                 inspectorPanel = .zoom
                 statusMessage =
                     "Recording ready — trim, split, or edit cursor zooms."
@@ -993,8 +1044,64 @@ final class EditorStore: ObservableObject {
             errorMessage = "The selected recording could not be found."
             return
         }
+        let wasRestoringProject = isRestoringProject
+        isRestoringProject = true
+        defer { isRestoringProject = wasRestoringProject }
         do {
-            try await loadVideo(item.url)
+            var recoveredArchiveWithoutSnapshot = false
+            let sidecarURL = RecordingProjectSidecar.url(for: item.url)
+            var snapshot = matchingSnapshot(
+                at: sidecarURL,
+                sourceURL: item.url
+            )
+            let recoveryCandidates = [
+                RecordingProjectSidecar.backupURL(for: item.url),
+                persistence.recoveryURL,
+                persistence.previousRecoveryURL
+            ].compactMap {
+                matchingSnapshot(at: $0, sourceURL: item.url)
+            }
+            if snapshot == nil {
+                snapshot = recoveryCandidates.first
+            }
+            if snapshot?.project.cursorSamples.isEmpty != false,
+               let recoveredProject = recoveryCandidates
+                    .map(\.project)
+                    .max(by: {
+                        $0.cursorSamples.count < $1.cursorSamples.count
+                    }),
+               !recoveredProject.cursorSamples.isEmpty {
+                snapshot?.project.cursorSamples =
+                    recoveredProject.cursorSamples
+                snapshot?.project.clicks = recoveredProject.clicks
+                snapshot?.project.shortcuts = recoveredProject.shortcuts
+            }
+            if let archive = try await RecordingInteractionMetadata.read(
+                from: item.url
+            ), !archive.isEmpty,
+               snapshot?.project.cursorSamples.isEmpty != false {
+                if snapshot == nil {
+                    project = TimelineProject()
+                    archive.applying(to: &project)
+                    try await loadVideo(
+                        item.url,
+                        preservingCapturedMetadata: true
+                    )
+                    recoveredArchiveWithoutSnapshot = true
+                } else {
+                    var recoveredSnapshot = snapshot!
+                    archive.applying(to: &recoveredSnapshot.project)
+                    snapshot = recoveredSnapshot
+                }
+            }
+            if let snapshot {
+                try await restore(snapshot)
+                try saveRecordingProjectSidecarIfNeeded()
+            } else if recoveredArchiveWithoutSnapshot {
+                try saveRecordingProjectSidecarIfNeeded()
+            } else {
+                try await loadVideo(item.url)
+            }
             inspectorPanel = .clip
             statusMessage = "Recording opened for editing."
         } catch {
@@ -1413,10 +1520,12 @@ final class EditorStore: ObservableObject {
     func requestInputMonitoringPermission() {
         inputMonitoringGranted = CGRequestListenEventAccess()
         if inputMonitoringGranted {
-            statusMessage = "Input Monitoring enabled for automatic click zooms."
+            statusMessage =
+                "Input Monitoring enabled for long-right-hold zooms."
         } else {
             openPrivacySettings(anchor: "Privacy_ListenEvent")
-            statusMessage = "Enable ScreenFree in Input Monitoring for automatic click zooms."
+            statusMessage =
+                "Enable ScreenFree in Input Monitoring for long-right-hold zooms."
         }
     }
 
@@ -1433,7 +1542,13 @@ final class EditorStore: ObservableObject {
         }
     }
 
-    func loadVideo(_ url: URL) async throws {
+    func loadVideo(
+        _ url: URL,
+        preservingCapturedMetadata: Bool = false
+    ) async throws {
+        let embeddedInteractions = preservingCapturedMetadata
+            ? nil
+            : try await RecordingInteractionMetadata.read(from: url)
         let asset = AVURLAsset(url: url)
         let duration = try await asset.load(.duration).seconds
         guard duration.isFinite, duration > 0 else {
@@ -1481,15 +1596,34 @@ final class EditorStore: ObservableObject {
             microphoneAudioVolume = 1
             microphoneAudioMuted = false
         }
-        let existingCursor = project.cursorSamples
-        let existingClicks = project.clicks
-        let existingShortcuts = project.shortcuts
+        let existingCursor: [CursorSample]
+        let existingClicks: [MouseClick]
+        let existingShortcuts: [ShortcutEvent]
+        if preservingCapturedMetadata {
+            existingCursor = project.cursorSamples
+            existingClicks = project.clicks
+            existingShortcuts = project.shortcuts
+        } else if let embeddedInteractions {
+            existingCursor = embeddedInteractions.cursorSamples
+            existingClicks = embeddedInteractions.clicks
+            existingShortcuts = embeddedInteractions.shortcuts
+        } else {
+            existingCursor = []
+            existingClicks = []
+            existingShortcuts = []
+        }
         project = TimelineProject(
             clips: [TimelineClip(sourceStart: 0, duration: duration)],
             cursorSamples: existingCursor,
             clicks: existingClicks,
             shortcuts: existingShortcuts
         )
+        if preservingCapturedMetadata || embeddedInteractions?.isEmpty == false {
+            // This checkpoint happens before thumbnail/audio analysis, which
+            // can take minutes for a long recording. Quitting during analysis
+            // must not lose the freshly captured cursor path.
+            try saveRecordingProjectSidecarIfNeeded()
+        }
         clearTimelineHistory()
         selectedClipID = project.clips.first?.id
         selectedZoomID = nil
@@ -1500,6 +1634,7 @@ final class EditorStore: ObservableObject {
         playhead = 0
         audioAnalysis = .empty
         player.replaceCurrentItem(with: AVPlayerItem(url: url))
+        startTimelineThumbnailGeneration(for: url, duration: duration)
         refreshSourceAudioMix()
         await player.seek(to: .zero)
         isAnalyzingAudio = true
@@ -1508,12 +1643,76 @@ final class EditorStore: ObservableObject {
         isAnalyzingAudio = false
     }
 
+    private func startTimelineThumbnailGeneration(
+        for url: URL,
+        duration: TimeInterval
+    ) {
+        timelineThumbnailTask?.cancel()
+        timelineThumbnails = []
+        let generation = UUID()
+        timelineThumbnailGeneration = generation
+        timelineThumbnailTask = Task { [weak self] in
+            guard let self else { return }
+            let asset = AVURLAsset(url: url)
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            generator.maximumSize = CGSize(width: 192, height: 108)
+            generator.requestedTimeToleranceBefore = CMTime(
+                seconds: 0.2,
+                preferredTimescale: 600
+            )
+            generator.requestedTimeToleranceAfter = CMTime(
+                seconds: 0.2,
+                preferredTimescale: 600
+            )
+
+            let targetSpacing: TimeInterval = 1.25
+            let frameCount = min(
+                180,
+                max(12, Int(ceil(duration / targetSpacing)))
+            )
+            var frames: [TimelineThumbnailFrame] = []
+            frames.reserveCapacity(frameCount)
+
+            for index in 0..<frameCount {
+                guard !Task.isCancelled,
+                      self.timelineThumbnailGeneration == generation,
+                      self.sourceURL == url else {
+                    return
+                }
+                let sourceTime = duration
+                    * (Double(index) + 0.5)
+                    / Double(frameCount)
+                let requestedTime = CMTime(
+                    seconds: sourceTime,
+                    preferredTimescale: 600
+                )
+                guard let result = try? await generator.image(
+                    at: requestedTime
+                ) else {
+                    continue
+                }
+                frames.append(
+                    TimelineThumbnailFrame(
+                        id: index,
+                        sourceTime: result.actualTime.seconds,
+                        image: NSImage(
+                            cgImage: result.image,
+                            size: .zero
+                        )
+                    )
+                )
+                if frames.count.isMultiple(of: 8)
+                    || index == frameCount - 1 {
+                    self.timelineThumbnails = frames
+                }
+            }
+        }
+    }
+
     func togglePlayback() {
         if isPlaying {
-            player.pause()
-            cameraPlayer.pause()
-            backgroundMusicPlayer.pause()
-            isPlaying = false
+            pausePreviewPlayback()
         } else {
             if playhead >= project.duration - 0.05 {
                 seek(to: 0)
@@ -1530,6 +1729,25 @@ final class EditorStore: ObservableObject {
             backgroundMusicPlayer.playImmediately(atRate: 1)
             isPlaying = true
         }
+    }
+
+    private func pausePreviewPlayback() {
+        player.pause()
+        cameraPlayer.pause()
+        backgroundMusicPlayer.pause()
+        isPlaying = false
+    }
+
+    @discardableResult
+    func handlePlaybackKey() -> Bool {
+        guard sourceURL != nil,
+              project.duration > 0,
+              !isRecording,
+              !isPreparingRecording else {
+            return false
+        }
+        togglePlayback()
+        return true
     }
 
     func stepFrame(_ direction: Int) {
@@ -1809,8 +2027,28 @@ final class EditorStore: ObservableObject {
     ) {
         if hovering {
             hoveredTimelineBlock = block
+            if timelineContains(block) {
+                selectTimelineBlock(block)
+            }
         } else if hoveredTimelineBlock == block {
             hoveredTimelineBlock = nil
+        }
+    }
+
+    private func selectTimelineBlock(_ block: TimelineBlockTarget) {
+        switch block {
+        case let .clip(id):
+            selectedClipID = id
+            inspectorPanel = .clip
+        case let .zoom(id):
+            selectedZoomID = id
+            inspectorPanel = .zoom
+        case let .redaction(id):
+            selectedRedactionID = id
+            inspectorPanel = .privacy
+        case let .annotation(id):
+            selectedAnnotationID = id
+            inspectorPanel = .annotation
         }
     }
 
@@ -1822,14 +2060,31 @@ final class EditorStore: ObservableObject {
             }
             return
         }
-        hoveredTimelineBlock = .clip(clipID)
+        setHoveredTimelineBlock(.clip(clipID), hovering: true)
     }
 
     @discardableResult
     func handleDeleteKey() -> Bool {
-        guard hoveredTimelineBlock != nil else { return false }
-        deleteCurrentSelection()
+        guard let target = hoveredTimelineBlock ?? selectedTimelineBlock else {
+            return false
+        }
+        deleteTimelineBlock(target)
         return true
+    }
+
+    private var selectedTimelineBlock: TimelineBlockTarget? {
+        switch inspectorPanel {
+        case .clip:
+            return selectedClipID.map(TimelineBlockTarget.clip)
+        case .zoom:
+            return selectedZoomID.map(TimelineBlockTarget.zoom)
+        case .privacy:
+            return selectedRedactionID.map(TimelineBlockTarget.redaction)
+        case .annotation:
+            return selectedAnnotationID.map(TimelineBlockTarget.annotation)
+        default:
+            return nil
+        }
     }
 
     func split(at timelineTime: TimeInterval) {
@@ -1851,21 +2106,35 @@ final class EditorStore: ObservableObject {
     }
 
     func deleteSelectedClip() {
-        deleteSelectedClip(
+        guard let selectedClipID else {
+            statusMessage = "Select a clip to delete it."
+            return
+        }
+        _ = deleteClip(id: selectedClipID)
+    }
+
+    @discardableResult
+    func deleteClip(id: UUID) -> Bool {
+        deleteClip(
+            id: id,
             historySnapshot: captureTimelineSnapshot()
         )
     }
 
-    private func deleteSelectedClip(
+    @discardableResult
+    private func deleteClip(
+        id: UUID,
         historySnapshot snapshot: TimelineEditorSnapshot
-    ) {
+    ) -> Bool {
         guard project.clips.count > 1,
-              let selectedClipID,
-              let index = project.clips.firstIndex(where: { $0.id == selectedClipID }) else {
+              let index = project.clips.firstIndex(where: { $0.id == id }) else {
             statusMessage = "Split the recording first; the final clip cannot be deleted."
-            return
+            return false
         }
         project.clips.remove(at: index)
+        if hoveredTimelineBlock == .clip(id) {
+            hoveredTimelineBlock = nil
+        }
         self.selectedClipID = project.clips.indices.contains(index)
             ? project.clips[index].id
             : project.clips.last?.id
@@ -1873,6 +2142,7 @@ final class EditorStore: ObservableObject {
         seek(to: min(playhead, project.duration))
         registerTimelineEdit("Delete Clip", before: snapshot)
         statusMessage = "Clip removed from the timeline."
+        return true
     }
 
     func deleteCurrentSelection() {
@@ -1904,9 +2174,7 @@ final class EditorStore: ObservableObject {
         let snapshot = captureTimelineSnapshot()
         switch block {
         case let .clip(id):
-            selectedClipID = id
-            inspectorPanel = .clip
-            deleteSelectedClip(historySnapshot: snapshot)
+            _ = deleteClip(id: id, historySnapshot: snapshot)
         case let .zoom(id):
             selectedZoomID = id
             inspectorPanel = .zoom
@@ -1969,6 +2237,96 @@ final class EditorStore: ObservableObject {
             registerTimelineEdit("Trim Clip", before: snapshot)
             statusMessage = start ? "Trimmed 0.25s from clip start." : "Trimmed 0.25s from clip end."
         }
+    }
+
+    var canTrimLeftAtPlayhead: Bool {
+        guard let context = clipContext(atTimelineTime: playhead) else {
+            return false
+        }
+        return playhead - context.timelineStart > 0.05
+    }
+
+    var canTrimRightAtPlayhead: Bool {
+        guard let context = clipContext(atTimelineTime: playhead) else {
+            return false
+        }
+        return context.timelineStart + context.clip.timelineDuration
+            - playhead > 0.05
+    }
+
+    /// CapCut-style one-click edge edit. Removing the left side advances the
+    /// source start to the playhead; removing the right side pulls the source
+    /// end back to the playhead.
+    func trimAtPlayhead(removingLeft: Bool) {
+        endContinuousTimelineEdit()
+        guard let context = clipContext(atTimelineTime: playhead) else {
+            return
+        }
+        let elapsedTimelineTime = (
+            playhead - context.timelineStart
+        ).clamped(to: 0...context.clip.timelineDuration)
+        let sourceTime = context.clip.sourceStart
+            + elapsedTimelineTime * context.clip.playbackRate
+        let snapshot = captureTimelineSnapshot()
+        let changed = removingLeft
+            ? project.setClipSourceStart(
+                clipID: context.clip.id,
+                to: sourceTime,
+                sourceDuration: sourceDuration
+            )
+            : project.setClipSourceEnd(
+                clipID: context.clip.id,
+                to: sourceTime,
+                sourceDuration: sourceDuration
+            )
+        guard changed else {
+            statusMessage = "Move the playhead farther inside the clip."
+            return
+        }
+        selectedClipID = context.clip.id
+        project.clampTimedEventsToDuration()
+        let newPlayhead = removingLeft
+            ? context.timelineStart
+            : min(playhead, project.duration)
+        seek(to: newPlayhead)
+        registerTimelineEdit(
+            removingLeft ? "Trim Clip Left" : "Trim Clip Right",
+            before: snapshot
+        )
+        statusMessage = removingLeft
+            ? "Trimmed everything left of the playhead."
+            : "Trimmed everything right of the playhead."
+    }
+
+    /// Updates one clip edge during a direct-manipulation timeline drag.
+    /// `beginContinuousTimelineEdit(.clip)` / `endContinuousTimelineEdit()`
+    /// group the entire gesture into a single undo operation.
+    func setClipTrimEdge(
+        clipID: UUID,
+        isLeading: Bool,
+        sourceTime: TimeInterval
+    ) {
+        guard project.clips.contains(where: { $0.id == clipID }) else {
+            return
+        }
+        selectedClipID = clipID
+        prepareTimelineMutation(.clip)
+        let snapshot = captureTimelineSnapshot()
+        let changed = isLeading
+            ? project.setClipSourceStart(
+                clipID: clipID,
+                to: sourceTime,
+                sourceDuration: sourceDuration
+            )
+            : project.setClipSourceEnd(
+                clipID: clipID,
+                to: sourceTime,
+                sourceDuration: sourceDuration
+            )
+        guard changed else { return }
+        project.clampTimedEventsToDuration()
+        seek(to: min(playhead, project.duration))
+        registerTimelineMutation(.clip, before: snapshot)
     }
 
     /// Current transition visual state for the preview, resolved through the
@@ -2216,7 +2574,7 @@ final class EditorStore: ObservableObject {
         selectedZoomID = project.zooms.first?.id
         registerTimelineEdit("Regenerate Zooms", before: snapshot)
         statusMessage = project.zooms.isEmpty
-            ? "No recorded clicks were found; add a zoom manually."
+            ? "No long right-button holds were found; add a zoom manually."
             : "Generated \(project.zooms.count) cursor-focused zooms."
     }
 
@@ -2344,14 +2702,70 @@ final class EditorStore: ObservableObject {
         let start = min(playhead, max(0, project.duration - 0.1))
         let redaction = PrivacyRedaction(
             start: start,
-            duration: min(3, max(0.1, project.duration - start))
+            duration: min(3, max(0.1, project.duration - start)),
+            effect: .blur
         )
         project.redactions.append(redaction)
         project.redactions.sort { $0.start < $1.start }
         selectedRedactionID = redaction.id
         inspectorPanel = .privacy
         registerTimelineEdit("Add Privacy Block", before: snapshot)
-        statusMessage = "Privacy redaction added."
+        statusMessage = "Privacy blur added."
+    }
+
+    func beginPrivacyTool() {
+        guard sourceURL != nil, project.duration > 0 else {
+            activeTimelineTool = .selection
+            inspectorPanel = .privacy
+            statusMessage = "Record or open a video before using Privacy mode."
+            return
+        }
+        activeTimelineTool = activeTimelineTool == .redaction
+            ? .selection
+            : .redaction
+        inspectorPanel = .privacy
+        statusMessage = activeTimelineTool == .redaction
+            ? "Privacy mode is active — drag on the video to blur any area."
+            : "Privacy mode closed."
+    }
+
+    func addRedaction(
+        startPoint: CGPoint,
+        endPoint: CGPoint,
+        start: TimeInterval? = nil,
+        duration: TimeInterval = 3
+    ) {
+        guard project.duration > 0 else { return }
+        let minX = min(startPoint.x, endPoint.x).clamped(to: 0...1)
+        let maxX = max(startPoint.x, endPoint.x).clamped(to: 0...1)
+        let minY = min(startPoint.y, endPoint.y).clamped(to: 0...1)
+        let maxY = max(startPoint.y, endPoint.y).clamped(to: 0...1)
+        guard maxX - minX >= 0.02, maxY - minY >= 0.02 else {
+            statusMessage = "Drag a larger area to create a privacy blur."
+            return
+        }
+        let snapshot = captureTimelineSnapshot()
+        let safeStart = (start ?? playhead).clamped(
+            to: 0...max(0, project.duration - 0.1)
+        )
+        let redaction = PrivacyRedaction(
+            start: safeStart,
+            duration: duration.clamped(
+                to: 0.1...max(0.1, project.duration - safeStart)
+            ),
+            normalizedX: (minX + maxX) / 2,
+            normalizedY: (minY + maxY) / 2,
+            normalizedWidth: maxX - minX,
+            normalizedHeight: maxY - minY,
+            opacity: 0.92,
+            effect: .blur
+        )
+        project.redactions.append(redaction)
+        project.redactions.sort { $0.start < $1.start }
+        selectedRedactionID = redaction.id
+        inspectorPanel = .privacy
+        registerTimelineEdit("Add Privacy Blur", before: snapshot)
+        statusMessage = "Privacy blur added to the timeline."
     }
 
     func addSpotlightAtPlayhead() {
@@ -2401,6 +2815,7 @@ final class EditorStore: ObservableObject {
         height: CGFloat? = nil,
         opacity: CGFloat? = nil,
         highlightHue: CGFloat? = nil,
+        effect: PrivacyRedactionEffect? = nil,
         duration: TimeInterval? = nil
     ) {
         guard let selectedRedactionID,
@@ -2428,6 +2843,9 @@ final class EditorStore: ObservableObject {
             project.redactions[index].highlightHue = highlightHue.clamped(
                 to: 0...1
             )
+        }
+        if let effect {
+            project.redactions[index].effect = effect
         }
         if let duration {
             project.setRedactionRange(
@@ -3331,11 +3749,23 @@ final class EditorStore: ObservableObject {
     }
 
     private func beginMouseCapture() {
+        let sessionID = UUID()
+        activeCursorCaptureSessionID = sessionID
         inputMonitoringGranted = CGPreflightListenEventAccess()
         let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) {
             [weak self] _ in
             Task { @MainActor in
-                self?.captureCursorSample(isClick: false)
+                guard let self,
+                      CursorCaptureGate.allows(
+                          callbackSessionID: sessionID,
+                          activeSessionID: self.activeCursorCaptureSessionID,
+                          isRecording: self.isRecording,
+                          isPaused: self.isRecordingPaused,
+                          isTransitioning: self.isTransitioningRecording
+                      ) else {
+                    return
+                }
+                self.captureCursorSample(isClick: false)
             }
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -3346,7 +3776,17 @@ final class EditorStore: ObservableObject {
                 matching: [.leftMouseDown, .rightMouseDown, .rightMouseUp]
             ) { [weak self] event in
                 Task { @MainActor in
-                    guard let self else { return }
+                    guard let self,
+                          CursorCaptureGate.allows(
+                              callbackSessionID: sessionID,
+                              activeSessionID:
+                                  self.activeCursorCaptureSessionID,
+                              isRecording: self.isRecording,
+                              isPaused: self.isRecordingPaused,
+                              isTransitioning: self.isTransitioningRecording
+                          ) else {
+                        return
+                    }
                     switch event.type {
                     case .leftMouseDown:
                         self.captureCursorSample(
@@ -3370,7 +3810,18 @@ final class EditorStore: ObservableObject {
                 matching: .keyDown
             ) { [weak self] event in
                 Task { @MainActor in
-                    self?.captureShortcut(event)
+                    guard let self,
+                          CursorCaptureGate.allows(
+                              callbackSessionID: sessionID,
+                              activeSessionID:
+                                  self.activeCursorCaptureSessionID,
+                              isRecording: self.isRecording,
+                              isPaused: self.isRecordingPaused,
+                              isTransitioning: self.isTransitioningRecording
+                          ) else {
+                        return
+                    }
+                    self.captureShortcut(event)
                 }
             }
         }
@@ -3454,9 +3905,40 @@ final class EditorStore: ObservableObject {
                       let snapshot = self.makeSnapshot() else {
                     return
                 }
-                try? self.persistence.save(snapshot, to: self.persistence.recoveryURL)
+                try? self.persistence.saveRecovery(snapshot)
+                try? self.saveRecordingProjectSidecarIfNeeded(snapshot)
             }
             .store(in: &cancellables)
+    }
+
+    private func saveRecordingProjectSidecarIfNeeded(
+        _ suppliedSnapshot: ScreenFreeProjectSnapshot? = nil
+    ) throws {
+        guard let sourceURL else { return }
+        let source = sourceURL.standardizedFileURL
+        guard source.deletingLastPathComponent()
+            == recordingHistoryCatalog.directory.standardizedFileURL else {
+            return
+        }
+        guard let snapshot = suppliedSnapshot ?? makeSnapshot() else { return }
+        try persistence.savePreservingRecordedInteractions(
+            snapshot,
+            to: RecordingProjectSidecar.url(for: source),
+            backupURL: RecordingProjectSidecar.backupURL(for: source)
+        )
+    }
+
+    private func matchingSnapshot(
+        at url: URL,
+        sourceURL: URL
+    ) -> ScreenFreeProjectSnapshot? {
+        guard FileManager.default.fileExists(atPath: url.path),
+              let snapshot = try? persistence.load(from: url),
+              URL(fileURLWithPath: snapshot.sourcePath).standardizedFileURL
+                == sourceURL.standardizedFileURL else {
+            return nil
+        }
+        return snapshot
     }
 
     private func makeSnapshot() -> ScreenFreeProjectSnapshot? {
@@ -3524,8 +4006,9 @@ final class EditorStore: ObservableObject {
     }
 
     private func restore(_ snapshot: ScreenFreeProjectSnapshot) async throws {
+        let wasRestoringProject = isRestoringProject
         isRestoringProject = true
-        defer { isRestoringProject = false }
+        defer { isRestoringProject = wasRestoringProject }
         let source = URL(fileURLWithPath: snapshot.sourcePath)
         try await loadVideo(source)
         project = snapshot.project
@@ -3621,6 +4104,7 @@ final class EditorStore: ObservableObject {
     }
 
     private func endMouseCapture() {
+        activeCursorCaptureSessionID = nil
         finishRightMouseCapture()
         cursorTimer?.invalidate()
         cursorTimer = nil

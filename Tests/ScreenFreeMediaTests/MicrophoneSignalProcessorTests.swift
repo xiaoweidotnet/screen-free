@@ -1,4 +1,5 @@
 import AudioToolbox
+import AVFoundation
 import CoreMedia
 import XCTest
 @testable import ScreenFree
@@ -122,6 +123,138 @@ final class MicrophoneSignalProcessorTests: XCTestCase {
         )
     }
 
+    func testProcessedRecordingBufferCarriesGainWithoutMutatingCaptureBuffer() throws {
+        let quietSpeech = makeSine(
+            amplitude: 0.025,
+            frequency: 520,
+            frames: 2_400
+        )
+        let captureBuffer = try makeFloatSampleBuffer(samples: quietSpeech)
+        let processor = MicrophoneSignalProcessor(
+            settings: .microphoneLoudness(
+                reduceNoise: false,
+                normalizeVolume: true
+            )
+        )
+
+        let recordingBuffer = try XCTUnwrap(
+            processor.processedSampleBuffer(captureBuffer)
+        )
+
+        XCTAssertEqual(
+            try samples(from: captureBuffer),
+            quietSpeech,
+            "ScreenCaptureKit owns the capture buffer; enhancement must be written to a new buffer."
+        )
+        XCTAssertGreaterThan(
+            rms(try samples(from: recordingBuffer)),
+            rms(quietSpeech) * 2.5,
+            "The sample buffer appended to AVAssetWriter must contain the enhanced PCM."
+        )
+        XCTAssertEqual(
+            recordingBuffer.presentationTimeStamp,
+            captureBuffer.presentationTimeStamp
+        )
+        XCTAssertEqual(
+            CMSampleBufferGetNumSamples(recordingBuffer),
+            CMSampleBufferGetNumSamples(captureBuffer)
+        )
+    }
+
+    func testEnhancedMicrophoneLevelSurvivesAACEncodingAndReopen() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let outputURL = directory.appendingPathComponent("microphone.m4a")
+        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .m4a)
+        let input = AVAssetWriterInput(
+            mediaType: .audio,
+            outputSettings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: 48_000,
+                AVNumberOfChannelsKey: 2,
+                AVEncoderBitRateKey: 192_000
+            ]
+        )
+        XCTAssertTrue(writer.canAdd(input))
+        writer.add(input)
+        XCTAssertTrue(writer.startWriting())
+        writer.startSession(atSourceTime: .zero)
+
+        let inputAmplitude: Float = 0.025
+        let processor = MicrophoneSignalProcessor(
+            settings: .microphoneLoudness(
+                reduceNoise: false,
+                normalizeVolume: true
+            )
+        )
+        let framesPerBuffer = 1_024
+        for index in 0..<24 {
+            while !input.isReadyForMoreMediaData {
+                try await Task.sleep(for: .milliseconds(2))
+            }
+            let captureBuffer = try makeFloatSampleBuffer(
+                samples: makeSine(
+                    amplitude: inputAmplitude,
+                    frequency: 520,
+                    frames: framesPerBuffer
+                ),
+                presentationTimeStamp: CMTime(
+                    value: Int64(index * framesPerBuffer),
+                    timescale: 48_000
+                )
+            )
+            let recordingBuffer = try XCTUnwrap(
+                processor.processedSampleBuffer(captureBuffer)
+            )
+            XCTAssertTrue(input.append(recordingBuffer))
+        }
+        input.markAsFinished()
+        await withCheckedContinuation { continuation in
+            writer.finishWriting { continuation.resume() }
+        }
+        XCTAssertEqual(
+            writer.status,
+            .completed,
+            writer.error?.localizedDescription ?? "AAC writer did not complete."
+        )
+
+        let decodedFile = try AVAudioFile(forReading: outputURL)
+        let decodedFormat = decodedFile.processingFormat
+        let decoded = try XCTUnwrap(
+            AVAudioPCMBuffer(
+                pcmFormat: decodedFormat,
+                frameCapacity: AVAudioFrameCount(decodedFile.length)
+            )
+        )
+        try decodedFile.read(into: decoded)
+        let channelData = try XCTUnwrap(decoded.floatChannelData)
+        var decodedSamples: [Float] = []
+        for channel in 0..<Int(decodedFormat.channelCount) {
+            decodedSamples.append(
+                contentsOf: UnsafeBufferPointer(
+                    start: channelData[channel],
+                    count: Int(decoded.frameLength)
+                )
+            )
+        }
+        let originalRMS = inputAmplitude / sqrt(2)
+        XCTAssertGreaterThan(
+            rms(decodedSamples),
+            originalRMS * 2.2,
+            "The louder PCM must still be present after AAC encoding and reopening the real media file."
+        )
+        XCTAssertLessThanOrEqual(
+            decodedSamples.map { abs($0) }.max() ?? 0,
+            1,
+            "The loudness repair must not introduce digital clipping."
+        )
+    }
+
     func testNoiseReductionDoesNotSwallowWeakSpeechBeforeNormalization() {
         var weakSpeech = makeSine(
             amplitude: 0.002,
@@ -170,7 +303,8 @@ final class MicrophoneSignalProcessorTests: XCTestCase {
     }
 
     private func makeFloatSampleBuffer(
-        samples: [Float]
+        samples: [Float],
+        presentationTimeStamp: CMTime = .zero
     ) throws -> CMSampleBuffer {
         var streamDescription = AudioStreamBasicDescription(
             mSampleRate: 48_000,
@@ -236,7 +370,7 @@ final class MicrophoneSignalProcessorTests: XCTestCase {
                 refcon: nil,
                 formatDescription: format,
                 sampleCount: samples.count / 2,
-                presentationTimeStamp: .zero,
+                presentationTimeStamp: presentationTimeStamp,
                 packetDescriptions: nil,
                 sampleBufferOut: &sampleBuffer
             ),

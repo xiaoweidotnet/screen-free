@@ -81,14 +81,23 @@ enum ProjectPersistenceError: LocalizedError {
 struct ProjectPersistence {
     let recoveryURL: URL
 
-    init() {
+    init(recoveryURL: URL? = nil) {
+        if let recoveryURL {
+            self.recoveryURL = recoveryURL
+            return
+        }
         let base = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
         ).first ?? FileManager.default.temporaryDirectory
-        recoveryURL = base
+        self.recoveryURL = base
             .appendingPathComponent("ScreenFree", isDirectory: true)
             .appendingPathComponent("Recovery.screenfree")
+    }
+
+    var previousRecoveryURL: URL {
+        recoveryURL.deletingPathExtension()
+            .appendingPathExtension("previous.screenfree")
     }
 
     func save(_ snapshot: ScreenFreeProjectSnapshot, to url: URL) throws {
@@ -100,6 +109,41 @@ struct ProjectPersistence {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         try encoder.encode(snapshot).write(to: url, options: .atomic)
+    }
+
+    /// Prevents a transient empty load state from erasing a cursor path that
+    /// was already captured for the same source recording. A previous copy is
+    /// retained as an additional recovery point before the atomic write.
+    func savePreservingRecordedInteractions(
+        _ snapshot: ScreenFreeProjectSnapshot,
+        to url: URL,
+        backupURL: URL? = nil
+    ) throws {
+        var protectedSnapshot = snapshot
+        if FileManager.default.fileExists(atPath: url.path),
+           let existing = try? load(from: url),
+           existing.sourcePath == snapshot.sourcePath,
+           snapshot.project.cursorSamples.isEmpty,
+           !existing.project.cursorSamples.isEmpty {
+            protectedSnapshot.project.cursorSamples =
+                existing.project.cursorSamples
+            protectedSnapshot.project.clicks = existing.project.clicks
+            protectedSnapshot.project.shortcuts = existing.project.shortcuts
+        }
+        if let backupURL,
+           FileManager.default.fileExists(atPath: url.path) {
+            try? FileManager.default.removeItem(at: backupURL)
+            try FileManager.default.copyItem(at: url, to: backupURL)
+        }
+        try save(protectedSnapshot, to: url)
+    }
+
+    func saveRecovery(_ snapshot: ScreenFreeProjectSnapshot) throws {
+        try savePreservingRecordedInteractions(
+            snapshot,
+            to: recoveryURL,
+            backupURL: previousRecoveryURL
+        )
     }
 
     func load(from url: URL) throws -> ScreenFreeProjectSnapshot {

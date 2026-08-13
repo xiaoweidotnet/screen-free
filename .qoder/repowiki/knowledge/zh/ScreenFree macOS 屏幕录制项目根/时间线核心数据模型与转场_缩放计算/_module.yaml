@@ -1,0 +1,9 @@
+schema_version: 1
+module_path: screenfree_core
+title: 时间线核心数据模型与转场/缩放计算
+scope:
+    - Sources/ScreenFreeCore/
+source_files: []
+depends_on: []
+related_to:
+    - path: tests

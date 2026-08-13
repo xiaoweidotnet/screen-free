@@ -1,4 +1,5 @@
 import AppKit
+import ScreenFreeCore
 import SwiftUI
 
 @MainActor
@@ -64,10 +65,11 @@ final class AreaSelectionCoordinator {
             )
         }
         let displayID = CGDirectDisplayID(number.uint32Value)
-        return CGSize(
-            width: CGDisplayPixelsWide(displayID),
-            height: CGDisplayPixelsHigh(displayID)
-        )
+        return DisplayPixelGeometryResolver.geometry(
+            displayID: displayID,
+            logicalSize: screen.frame.size,
+            fallbackScale: screen.backingScaleFactor
+        ).pixelSize
     }
 }
 
@@ -93,6 +95,21 @@ private struct AreaSelectionView: View {
                 height: geometry.size.height * initialSelection.height
             )
             let selection = currentRect ?? initialRect
+            let normalizedSelection = CGRect(
+                x: selection.minX / geometry.size.width,
+                y: selection.minY / geometry.size.height,
+                width: selection.width / geometry.size.width,
+                height: selection.height / geometry.size.height
+            )
+            let displayGeometry = RecordingDisplayGeometry(
+                logicalSize: geometry.size,
+                pixelSize: displayPixelSize
+            )
+            let outputSize = displayGeometry.areaOutputSize(
+                forLogicalSourceRect: displayGeometry.logicalSourceRect(
+                    normalizedArea: normalizedSelection
+                )
+            )
 
             ZStack {
                 Path { path in
@@ -112,8 +129,8 @@ private struct AreaSelectionView: View {
                     .position(x: selection.midX, y: selection.midY)
                     .overlay {
                         Rectangle()
-                            .stroke(Color.purple, lineWidth: 3)
-                            .shadow(color: .purple.opacity(0.75), radius: 7)
+                            .stroke(StudioTheme.accentBright, lineWidth: 3)
+                            .shadow(color: StudioTheme.accent.opacity(0.5), radius: 7)
                     }
 
                 VStack {
@@ -131,7 +148,7 @@ private struct AreaSelectionView: View {
 
                     HStack(spacing: 12) {
                         Text(
-                            "\(Int((selection.width / geometry.size.width * displayPixelSize.width).rounded())) × \(Int((selection.height / geometry.size.height * displayPixelSize.height).rounded()))"
+                            "\(Int(outputSize.width)) × \(Int(outputSize.height))"
                         )
                         .font(.system(.body, design: .monospaced))
                         .foregroundStyle(.secondary)
@@ -139,13 +156,7 @@ private struct AreaSelectionView: View {
                         Button("Cancel", action: onCancel)
                             .keyboardShortcut(.cancelAction)
                         Button("Use Area") {
-                            let normalized = CGRect(
-                                x: selection.minX / geometry.size.width,
-                                y: selection.minY / geometry.size.height,
-                                width: selection.width / geometry.size.width,
-                                height: selection.height / geometry.size.height
-                            )
-                            onConfirm(normalized)
+                            onConfirm(normalizedSelection)
                         }
                         .keyboardShortcut(.defaultAction)
                         .buttonStyle(.borderedProminent)

@@ -78,8 +78,12 @@ final class RecordingHistoryTests: XCTestCase {
 
         let first = directory.appendingPathComponent("Recording-a.mp4")
         let second = directory.appendingPathComponent("Recording-b.mp4")
+        let firstSidecar = RecordingProjectSidecar.url(for: first)
+        let firstSidecarBackup = RecordingProjectSidecar.backupURL(for: first)
         try Data([0x01]).write(to: first)
         try Data([0x02]).write(to: second)
+        try Data([0x03]).write(to: firstSidecar)
+        try Data([0x04]).write(to: firstSidecarBackup)
 
         let catalog = RecordingHistoryCatalog(
             directory: directory,
@@ -94,6 +98,8 @@ final class RecordingHistoryTests: XCTestCase {
 
         XCTAssertEqual(deleted, 1)
         XCTAssertFalse(fileManager.fileExists(atPath: first.path))
+        XCTAssertFalse(fileManager.fileExists(atPath: firstSidecar.path))
+        XCTAssertFalse(fileManager.fileExists(atPath: firstSidecarBackup.path))
         XCTAssertTrue(fileManager.fileExists(atPath: second.path))
         XCTAssertEqual(catalog.recordings().map(\.url), [second])
     }

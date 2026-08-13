@@ -91,6 +91,49 @@ final class MicrophoneSignalProcessor: @unchecked Sendable {
         automaticGain.removeAll(keepingCapacity: true)
     }
 
+    /// Returns the buffer that should be appended to `AVAssetWriter`.
+    ///
+    /// ScreenCaptureKit owns its callback buffer. Asking Core Media for an
+    /// aligned `AudioBufferList` is allowed to return copied storage, so
+    /// mutating that list and then appending the original sample buffer can
+    /// silently discard every enhancement. Build an owned PCM buffer first,
+    /// process that buffer, and append the returned sample buffer instead.
+    func processedSampleBuffer(
+        _ captureBuffer: CMSampleBuffer
+    ) -> CMSampleBuffer? {
+        guard settings.isEnabled else { return captureBuffer }
+        guard let formatDescription = CMSampleBufferGetFormatDescription(
+                  captureBuffer
+              ),
+              let streamDescription =
+                  CMAudioFormatDescriptionGetStreamBasicDescription(
+                      formatDescription
+                  )?.pointee,
+              streamDescription.mFormatID == kAudioFormatLinearPCM,
+              let copiedData = copiedAudioData(from: captureBuffer) else {
+            return nil
+        }
+
+        var recordingBuffer: CMSampleBuffer?
+        let status = CMAudioSampleBufferCreateWithPacketDescriptions(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: copiedData,
+            dataReady: true,
+            makeDataReadyCallback: nil,
+            refcon: nil,
+            formatDescription: formatDescription,
+            sampleCount: CMSampleBufferGetNumSamples(captureBuffer),
+            presentationTimeStamp: captureBuffer.presentationTimeStamp,
+            packetDescriptions: nil,
+            sampleBufferOut: &recordingBuffer
+        )
+        guard status == noErr, let recordingBuffer,
+              process(recordingBuffer) else {
+            return nil
+        }
+        return recordingBuffer
+    }
+
     @discardableResult
     func process(_ sampleBuffer: CMSampleBuffer) -> Bool {
         guard settings.isEnabled,
@@ -204,6 +247,121 @@ final class MicrophoneSignalProcessor: @unchecked Sendable {
             }
         }
         return processed
+    }
+
+    private func copiedAudioData(
+        from sampleBuffer: CMSampleBuffer
+    ) -> CMBlockBuffer? {
+        if let source = CMSampleBufferGetDataBuffer(sampleBuffer) {
+            let length = CMBlockBufferGetDataLength(source)
+            guard length > 0,
+                  let destination = makeBlockBuffer(length: length) else {
+                return nil
+            }
+            var bytes = [UInt8](repeating: 0, count: length)
+            guard bytes.withUnsafeMutableBytes({ rawBuffer in
+                guard let baseAddress = rawBuffer.baseAddress else {
+                    return false
+                }
+                return CMBlockBufferCopyDataBytes(
+                    source,
+                    atOffset: 0,
+                    dataLength: length,
+                    destination: baseAddress
+                ) == kCMBlockBufferNoErr
+            }),
+                bytes.withUnsafeBytes({ rawBuffer in
+                    guard let baseAddress = rawBuffer.baseAddress else {
+                        return false
+                    }
+                    return CMBlockBufferReplaceDataBytes(
+                        with: baseAddress,
+                        blockBuffer: destination,
+                        offsetIntoDestination: 0,
+                        dataLength: length
+                    ) == kCMBlockBufferNoErr
+                }) else {
+                return nil
+            }
+            return destination
+        }
+
+        var requiredSize = 0
+        var retainedBlockBuffer: CMBlockBuffer?
+        guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: &requiredSize,
+            bufferListOut: nil,
+            bufferListSize: 0,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: 0,
+            blockBufferOut: &retainedBlockBuffer
+        ) == noErr,
+            requiredSize > 0 else {
+            return nil
+        }
+
+        let storage = UnsafeMutableRawPointer.allocate(
+            byteCount: requiredSize,
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { storage.deallocate() }
+        let list = storage.bindMemory(to: AudioBufferList.self, capacity: 1)
+        guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: list,
+            bufferListSize: requiredSize,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: 0,
+            blockBufferOut: &retainedBlockBuffer
+        ) == noErr else {
+            return nil
+        }
+
+        let buffers = UnsafeMutableAudioBufferListPointer(list)
+        let totalLength = buffers.reduce(0) {
+            $0 + Int($1.mDataByteSize)
+        }
+        guard totalLength > 0,
+              let destination = makeBlockBuffer(length: totalLength) else {
+            return nil
+        }
+        var offset = 0
+        for buffer in buffers {
+            let length = Int(buffer.mDataByteSize)
+            guard let data = buffer.mData,
+                  CMBlockBufferReplaceDataBytes(
+                      with: data,
+                      blockBuffer: destination,
+                      offsetIntoDestination: offset,
+                      dataLength: length
+                  ) == kCMBlockBufferNoErr else {
+                return nil
+            }
+            offset += length
+        }
+        return destination
+    }
+
+    private func makeBlockBuffer(length: Int) -> CMBlockBuffer? {
+        var blockBuffer: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: nil,
+            blockLength: length,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: length,
+            flags: 0,
+            blockBufferOut: &blockBuffer
+        ) == kCMBlockBufferNoErr else {
+            return nil
+        }
+        return blockBuffer
     }
 
     func process(

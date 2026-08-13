@@ -187,8 +187,97 @@ struct ResolvedZoomMotion {
     let focusY: CGFloat
 }
 
+enum ZoomFocusResolver {
+    private static let followDelay: TimeInterval = 0.36
+
+    static func focus(
+        at time: TimeInterval,
+        zoomState: ResolvedZoomMotion,
+        project: TimelineProject,
+        cursorTailFreeze: TimeInterval,
+        cursorLoopToStart: Bool,
+        removeCursorShakes: Bool,
+        cursorShakeThreshold: CGFloat,
+        optimizeRapidCursorChanges: Bool,
+        smoothCursorMovement: Bool,
+        processedCursorSamples: [CursorSample]? = nil
+    ) -> CGPoint {
+        guard zoomState.zoom.resolvedFollowsCursor else {
+            return CGPoint(
+                x: zoomState.focusX,
+                y: zoomState.focusY
+            )
+        }
+
+        let chainStart = continuousChainStart(
+            containing: zoomState.zoom,
+            zooms: project.zooms
+        )
+        let availableDelay = max(0, time - chainStart)
+        let delay = min(followDelay, availableDelay)
+        let sampleTimes = [
+            time - delay,
+            time - delay * 0.5,
+            time
+        ]
+        let weights: [CGFloat] = [0.5, 0.32, 0.18]
+        let cursorSamples = processedCursorSamples
+            ?? project.processedCursorSamples(
+                removeShakes: removeCursorShakes,
+                shakeThreshold: cursorShakeThreshold,
+                optimizeRapidChanges: optimizeRapidCursorChanges
+            )
+        var weightedX: CGFloat = 0
+        var weightedY: CGFloat = 0
+        var totalWeight: CGFloat = 0
+
+        for (sampleTime, weight) in zip(sampleTimes, weights) {
+            guard let cursor = project.cursorSample(
+                atTimelineTime: sampleTime,
+                using: cursorSamples,
+                freezeBeforeEnd: cursorTailFreeze,
+                loopToStart: cursorLoopToStart,
+                smoothMovement: smoothCursorMovement
+            ) else {
+                continue
+            }
+            weightedX += cursor.normalizedX * weight
+            weightedY += cursor.normalizedY * weight
+            totalWeight += weight
+        }
+
+        guard totalWeight > 0 else {
+            return CGPoint(x: zoomState.focusX, y: zoomState.focusY)
+        }
+        return CGPoint(
+            x: (weightedX / totalWeight).clamped(to: 0...1),
+            y: (weightedY / totalWeight).clamped(to: 0...1)
+        )
+    }
+
+    private static func continuousChainStart(
+        containing zoom: ZoomEvent,
+        zooms: [ZoomEvent]
+    ) -> TimeInterval {
+        let ordered = zooms.sorted { $0.start < $1.start }
+        guard var index = ordered.firstIndex(where: { $0.id == zoom.id }) else {
+            return zoom.start
+        }
+        while index > 0 {
+            let previous = ordered[index - 1]
+            let current = ordered[index]
+            guard current.start - previous.end
+                    <= ZoomMotionResolver.continuityTolerance else {
+                break
+            }
+            index -= 1
+        }
+        return ordered[index].start
+    }
+}
+
 enum ZoomMotionResolver {
-    private static let continuityTolerance: TimeInterval = 1.0 / 120.0
+    static let continuityTolerance: TimeInterval = 1.0 / 30.0
 
     private struct Segment {
         let zoom: ZoomEvent
@@ -207,6 +296,36 @@ enum ZoomMotionResolver {
             totalDuration: totalDuration
         )
         for (index, segment) in segments.enumerated() {
+            if index + 1 < segments.count {
+                let next = segments[index + 1]
+                let gap = next.start - segment.end
+                if gap > 0,
+                   gap <= continuityTolerance,
+                   time > segment.end,
+                   time < next.start {
+                    let progress = motion.easedProgress(
+                        CGFloat((time - segment.end) / gap)
+                    )
+                    return ResolvedZoomMotion(
+                        zoom: next.zoom,
+                        scale: interpolate(
+                            from: segment.zoom.scale,
+                            to: next.zoom.scale,
+                            progress: progress
+                        ),
+                        focusX: interpolate(
+                            from: segment.zoom.focusX,
+                            to: next.zoom.focusX,
+                            progress: progress
+                        ),
+                        focusY: interpolate(
+                            from: segment.zoom.focusY,
+                            to: next.zoom.focusY,
+                            progress: progress
+                        )
+                    )
+                }
+            }
             guard time >= segment.start, time <= segment.end else {
                 continue
             }

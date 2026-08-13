@@ -33,9 +33,16 @@ struct TimelineView: View {
                         duration: duration,
                         scale: scale
                     )
-                    .frame(width: contentWidth, height: 57)
+                    .frame(width: contentWidth, height: 104)
 
                     zoomTrack(
+                        width: contentWidth,
+                        duration: duration,
+                        scale: scale
+                    )
+                    .frame(width: contentWidth, height: 39)
+
+                    privacyTrack(
                         width: contentWidth,
                         duration: duration,
                         scale: scale
@@ -69,7 +76,13 @@ struct TimelineView: View {
                     DragGesture(minimumDistance: 0)
                         .onChanged { value in
                             guard store.sourceURL != nil,
-                                  store.activeTimelineTool == .selection else {
+                                  store.activeTimelineTool == .selection,
+                                  !startsOnClipTrimHandle(
+                                    x: value.startLocation.x - 17,
+                                    width: contentWidth,
+                                    duration: duration,
+                                    scale: scale
+                                  ) else {
                                 return
                             }
                             let time = scale.time(
@@ -82,6 +95,12 @@ struct TimelineView: View {
                         .onEnded { value in
                             guard store.sourceURL != nil,
                                   store.activeTimelineTool == .selection,
+                                  !startsOnClipTrimHandle(
+                                    x: value.startLocation.x - 17,
+                                    width: contentWidth,
+                                    duration: duration,
+                                    scale: scale
+                                  ),
                                   abs(value.translation.width) < 4,
                                   abs(value.translation.height) < 4 else {
                                 return
@@ -118,7 +137,7 @@ struct TimelineView: View {
                 .padding(.top, 5)
                 .padding(.trailing, 22)
         }
-        .background(.black.opacity(0.38))
+        .background(StudioTheme.canvas)
         .onChange(of: store.activeTimelineTool) {
             if store.activeTimelineTool != .split {
                 updateSplitCursor(false)
@@ -205,6 +224,40 @@ struct TimelineView: View {
         .accessibilityLabel("Timeline zoom")
     }
 
+    private func startsOnClipTrimHandle(
+        x: CGFloat,
+        width: CGFloat,
+        duration: TimeInterval,
+        scale: TimelineScale
+    ) -> Bool {
+        guard store.activeTimelineTool == .selection else { return false }
+        let hitRadius: CGFloat = 18
+        var timelineStart: TimeInterval = 0
+        for clip in store.project.clips {
+            let isExposingHandles = clip.id == store.selectedClipID
+                || store.hoveredTimelineBlock == .clip(clip.id)
+            let timelineEnd = timelineStart + clip.timelineDuration
+            if isExposingHandles {
+                let leadingX = scale.x(
+                    forTime: timelineStart,
+                    duration: duration,
+                    contentWidth: width
+                )
+                let trailingX = scale.x(
+                    forTime: timelineEnd,
+                    duration: duration,
+                    contentWidth: width
+                )
+                if abs(x - leadingX) <= hitRadius
+                    || abs(x - trailingX) <= hitRadius {
+                    return true
+                }
+            }
+            timelineStart = timelineEnd
+        }
+        return false
+    }
+
     private func ruler(
         width: CGFloat,
         duration: TimeInterval,
@@ -257,8 +310,11 @@ struct TimelineView: View {
                     .foregroundStyle(.tertiary)
                     .frame(maxWidth: .infinity)
             } else {
-                ForEach(Array(store.project.clips.enumerated()), id: \.element.id) {
-                    index, clip in
+                HStack(spacing: 0) {
+                    ForEach(
+                        Array(store.project.clips.enumerated()),
+                        id: \.element.id
+                    ) { index, clip in
                     let selected = clip.id == store.selectedClipID
                     let hovered =
                         store.hoveredTimelineBlock == .clip(clip.id)
@@ -277,99 +333,41 @@ struct TimelineView: View {
                         contentWidth: width
                     )
                     let clipWidth = max(1, clipEndX - clipStartX)
-                    ZStack(alignment: .leading) {
-                        RoundedRectangle(cornerRadius: 7)
-                            .fill(
-                                LinearGradient(
-                                    colors: [
-                                        Color.orange.opacity(emphasized ? 0.95 : 0.72),
-                                        Color.yellow.opacity(emphasized ? 0.78 : 0.53)
-                                    ],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
+                    TimelineClipFilmstrip(
+                        clip: clip,
+                        index: index,
+                        selected: selected,
+                        hovered: hovered,
+                        trimmingEnabled: store.activeTimelineTool == .selection,
+                        thumbnails: store.timelineThumbnails,
+                        waveformSamples: store.audioAnalysis.waveform,
+                        sourceDuration: store.sourceDuration,
+                        appLanguage: store.appLanguage,
+                        timelineSecondsPerPoint: scale.timeDelta(
+                            forPointDistance: 1,
+                            duration: duration,
+                            contentWidth: width
+                        ),
+                        onSelect: {
+                            store.selectedClipID = clip.id
+                            store.inspectorPanel = .clip
+                        },
+                        onTrimChange: { isLeading, sourceTime in
+                            store.setClipTrimEdge(
+                                clipID: clip.id,
+                                isLeading: isLeading,
+                                sourceTime: sourceTime
                             )
-                        waveform(for: clip)
-                            .padding(.horizontal, 7)
-                            .opacity(0.72)
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                HStack(spacing: 4) {
-                                    Label(
-                                        "\(index + 1)",
-                                        systemImage: "scissors"
-                                    )
-                                        .font(.system(size: 11, weight: .semibold))
-                                        .accessibilityLabel(
-                                            Text(
-                                                L10n.text(
-                                                    "Edited clip %d",
-                                                    language: store.appLanguage,
-                                                    index + 1
-                                                )
-                                            )
-                                        )
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 2)
-                                        .background(
-                                            .black.opacity(0.2),
-                                            in: Capsule()
-                                        )
-                                    if clip.isEdited(
-                                        sourceDuration: store.sourceDuration
-                                    ) {
-                                        Label(
-                                            L10n.text(
-                                                "Edited",
-                                                language: store.appLanguage
-                                            ),
-                                            systemImage: "pencil"
-                                        )
-                                            .font(
-                                                .system(size: 9, weight: .bold)
-                                            )
-                                            .padding(.horizontal, 6)
-                                            .padding(.vertical, 2)
-                                            .background(
-                                                Color.purple.opacity(0.85),
-                                                in: Capsule()
-                                            )
-                                    }
-                                }
-                                Text(
-                                    "\(clip.timelineDuration, specifier: "%.1f")s · \(clip.playbackRate, specifier: "%.1f")×"
-                                )
-                                    .font(.system(size: 9, design: .monospaced))
-                                    .opacity(0.78)
-                            }
-                            Spacer()
-                            if selected, clipWidth >= 120 {
-                                HStack(spacing: 4) {
-                                    Button {
-                                        store.trimSelected(start: true)
-                                    } label: {
-                                        Image(systemName: "arrow.right.to.line.compact")
-                                    }
-                                    Button {
-                                        store.trimSelected(start: false)
-                                    } label: {
-                                        Image(systemName: "arrow.left.to.line.compact")
-                                    }
-                                }
-                                .buttonStyle(.plain)
-                            }
+                        },
+                        onEditBegan: {
+                            store.beginContinuousTimelineEdit(.clip)
+                        },
+                        onEditEnded: {
+                            store.endContinuousTimelineEdit()
                         }
-                        .padding(.horizontal, 9)
-                        .padding(.top, 5)
-                        .frame(
-                            maxWidth: .infinity,
-                            maxHeight: .infinity,
-                            alignment: .topLeading
-                        )
-                    }
+                    )
                     .frame(width: clipWidth)
                     .clipped()
-                    .offset(x: clipStartX)
                     .contentShape(RoundedRectangle(cornerRadius: 7))
                     .accessibilityIdentifier("timeline.clip.\(clip.id.uuidString)")
                     .accessibilityValue(hovered ? "Hovered" : (selected ? "Selected" : ""))
@@ -379,13 +377,50 @@ struct TimelineView: View {
                             store.inspectorPanel = .clip
                         }
                     }
+                    .simultaneousGesture(
+                        SpatialTapGesture()
+                            .onEnded { value in
+                                guard store.activeTimelineTool == .split else {
+                                    return
+                                }
+                                let splitTime = (
+                                    timelineStart
+                                        + Double(value.location.x)
+                                            * scale.timeDelta(
+                                                forPointDistance: 1,
+                                                duration: duration,
+                                                contentWidth: width
+                                            )
+                                ).clamped(
+                                    to: timelineStart...(timelineStart
+                                        + clip.timelineDuration)
+                                )
+                                store.split(at: splitTime)
+                                store.setHoveredClip(
+                                    atTimelineTime: splitTime
+                                )
+                            }
+                    )
                     .onHover { hovering in
                         store.setHoveredTimelineBlock(
                             .clip(clip.id),
                             hovering: hovering
                         )
+                        updateSplitCursor(
+                            hovering
+                                && store.activeTimelineTool == .split
+                        )
                     }
                     .contextMenu {
+                        Button(role: .destructive) {
+                            store.deleteClip(id: clip.id)
+                        } label: {
+                            Label("Delete clip", systemImage: "trash")
+                        }
+                        .disabled(store.project.clips.count <= 1)
+
+                        Divider()
+
                         Menu("Set speed") {
                             ForEach(
                                 [0.5, 0.75, 1, 1.25, 1.5, 2, 4],
@@ -429,16 +464,6 @@ struct TimelineView: View {
                                 }
                             }
                         }
-
-                        Divider()
-
-                        Button(role: .destructive) {
-                            store.selectedClipID = clip.id
-                            store.deleteSelectedClip()
-                        } label: {
-                            Label("Remove", systemImage: "trash")
-                        }
-                        .disabled(store.project.clips.count <= 1)
 
                         Button {
                             store.selectedClipID = clip.id
@@ -486,18 +511,27 @@ struct TimelineView: View {
                         RoundedRectangle(cornerRadius: 7)
                             .stroke(
                                 emphasized
-                                    ? Color.white.opacity(0.95)
+                                    ? StudioTheme.accentBright
                                     : Color.white.opacity(0.12),
                                 lineWidth: emphasized ? 1.5 : 1
                             )
                     }
                 }
+                }
+                .frame(width: width, height: 104, alignment: .leading)
 
                 // Transition markers on the cuts between adjacent clips.
                 ForEach(
                     Array(store.project.transitionJunctions().enumerated()),
                     id: \.element.leftClipID
                 ) { _, junction in
+                    cutSeam(
+                        x: scale.x(
+                            forTime: junction.time,
+                            duration: duration,
+                            contentWidth: width
+                        )
+                    )
                     transitionMarker(
                         junction: junction,
                         x: scale.x(
@@ -509,49 +543,29 @@ struct TimelineView: View {
                     )
                 }
 
-                if store.activeTimelineTool == .split {
-                    Color.clear
-                        .contentShape(Rectangle())
-                        .gesture(
-                            DragGesture(minimumDistance: 0)
-                                .onEnded { value in
-                                    let splitTime = scale.time(
-                                        atX: value.location.x,
-                                        duration: duration,
-                                        contentWidth: width
-                                    )
-                                    store.split(at: splitTime)
-                                    store.setHoveredClip(
-                                        atTimelineTime: splitTime
-                                    )
-                                }
-                        )
-                        .onContinuousHover { phase in
-                            switch phase {
-                            case let .active(location):
-                                let hoverTime = scale.time(
-                                    atX: location.x,
-                                    duration: duration,
-                                    contentWidth: width
-                                )
-                                store.setHoveredClip(
-                                    atTimelineTime: hoverTime
-                                )
-                            case .ended:
-                                store.setHoveredClip(atTimelineTime: nil)
-                            }
-                        }
-                        .onHover { hovering in
-                            updateSplitCursor(hovering)
-                        }
-                        .accessibilityLabel("Split video track")
-                        .accessibilityHint(
-                            "Click anywhere to split at that time. Press Escape to exit."
-                        )
-                        .zIndex(10)
-                }
             }
         }
+    }
+
+    private func cutSeam(x: CGFloat) -> some View {
+        ZStack {
+            Rectangle()
+                .fill(StudioTheme.canvas)
+                .frame(width: 5, height: 104)
+            HStack(spacing: 2) {
+                Rectangle()
+                    .fill(.white.opacity(0.24))
+                    .frame(width: 1)
+                Rectangle()
+                    .fill(.black.opacity(0.8))
+                    .frame(width: 1)
+            }
+            .frame(height: 104)
+        }
+        .offset(x: x - 2.5)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+        .zIndex(4)
     }
 
     private func updateSplitCursor(_ active: Bool) {
@@ -731,7 +745,7 @@ struct TimelineView: View {
                     width: width,
                     duration: duration,
                     scale: scale,
-                    color: .purple
+                    color: StudioTheme.zoom
                 )
             }
 
@@ -843,12 +857,12 @@ struct TimelineView: View {
         )
         return ZStack(alignment: .top) {
             Rectangle()
-                .fill(Color.purple)
-                .frame(width: 1.5, height: 126)
+                .fill(StudioTheme.playhead)
+                .frame(width: 1.5, height: 228)
                 .offset(y: 7)
             Image(systemName: "diamond.fill")
                 .font(.system(size: 10))
-                .foregroundStyle(.purple)
+                .foregroundStyle(StudioTheme.playhead)
         }
         .frame(width: 14)
         .offset(x: x - 7)
@@ -928,6 +942,19 @@ struct TimelineView: View {
                     y: 6
                 )
                 .zIndex(selected || hovered ? 1 : 0)
+                .contextMenu {
+                    Button(role: .destructive) {
+                        store.selectedRedactionID = redaction.id
+                        store.deleteSelectedRedaction()
+                    } label: {
+                        Label(
+                            redaction.resolvedPresentation == .spotlight
+                                ? "Delete spotlight"
+                                : "Delete privacy blur",
+                            systemImage: "trash"
+                        )
+                    }
+                }
             }
         }
     }
@@ -1266,6 +1293,274 @@ private struct AnnotationRangeBar: View {
     }
 }
 
+private struct TimelineClipFilmstrip: View {
+    let clip: TimelineClip
+    let index: Int
+    let selected: Bool
+    let hovered: Bool
+    let trimmingEnabled: Bool
+    let thumbnails: [TimelineThumbnailFrame]
+    let waveformSamples: [Float]
+    let sourceDuration: TimeInterval
+    let appLanguage: AppLanguage
+    let timelineSecondsPerPoint: TimeInterval
+    let onSelect: () -> Void
+    let onTrimChange: (Bool, TimeInterval) -> Void
+    let onEditBegan: () -> Void
+    let onEditEnded: () -> Void
+
+    private struct TrimOrigin {
+        let sourceTime: TimeInterval
+        let timelineSecondsPerPoint: TimeInterval
+    }
+
+    @State private var leadingOrigin: TrimOrigin?
+    @State private var trailingOrigin: TrimOrigin?
+    @State private var trimCursorPushed = false
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .topLeading) {
+                VStack(spacing: 0) {
+                    filmstrip(width: geometry.size.width)
+                        .frame(height: 70)
+
+                    ZStack(alignment: .bottomLeading) {
+                        StudioTheme.accentMuted.opacity(0.82)
+                        waveform
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 4)
+
+                        if geometry.size.width >= 92 {
+                            Label(
+                                "\(Int((clip.volume * 100).rounded()))%",
+                                systemImage: clip.volume <= 0.001
+                                    ? "speaker.slash.fill"
+                                    : "speaker.wave.2.fill"
+                            )
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.82))
+                            .padding(.leading, 7)
+                            .padding(.bottom, 3)
+                        }
+                    }
+                    .frame(maxHeight: .infinity)
+                }
+
+                clipBadge
+                    .padding(.top, 5)
+                    .padding(.leading, selected || hovered ? 18 : 7)
+
+                if trimmingEnabled, selected || hovered {
+                    HStack(spacing: 0) {
+                        trimHandle(isLeading: true)
+                        Spacer(minLength: 0)
+                        trimHandle(isLeading: false)
+                    }
+                    .transition(.opacity)
+                }
+            }
+            .background(StudioTheme.raisedSurface)
+            .animation(.easeOut(duration: 0.12), value: selected || hovered)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            Text(
+                L10n.text(
+                    "Edited clip %d",
+                    language: appLanguage,
+                    index + 1
+                )
+            )
+        )
+        .accessibilityHint("Drag either edge to trim the clip")
+        .onDisappear {
+            updateTrimCursor(false)
+        }
+    }
+
+    private var clipBadge: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "scissors")
+            Text(segmentLabel)
+            Text("\(clip.timelineDuration, specifier: "%.1f")s")
+            if abs(clip.playbackRate - 1) > 0.001 {
+                Text("\(clip.playbackRate, specifier: "%.1f")×")
+            }
+        }
+        .font(.system(size: 9, weight: .semibold, design: .rounded))
+        .foregroundStyle(.white.opacity(0.92))
+        .padding(.horizontal, 7)
+        .frame(height: 20)
+        .background(
+            selected || hovered
+                ? StudioTheme.accent.opacity(0.94)
+                : .black.opacity(0.72),
+            in: RoundedRectangle(cornerRadius: 5)
+        )
+    }
+
+    private var segmentLabel: String {
+        guard index >= 0,
+              index < 26,
+              let scalar = UnicodeScalar(65 + index) else {
+            return "\(index + 1)"
+        }
+        return String(Character(scalar))
+    }
+
+    @ViewBuilder
+    private func filmstrip(width: CGFloat) -> some View {
+        let tileCount = max(1, Int(ceil(width / 82)))
+        let tileWidth = width / CGFloat(tileCount)
+        HStack(spacing: 1) {
+            ForEach(0..<tileCount, id: \.self) { tile in
+                let fraction = (Double(tile) + 0.5) / Double(tileCount)
+                let sourceTime = clip.sourceStart + clip.duration * fraction
+                Group {
+                    if let image = nearestThumbnail(to: sourceTime) {
+                        Image(nsImage: image)
+                            .resizable()
+                            .interpolation(.medium)
+                            .scaledToFill()
+                    } else {
+                        StudioTheme.elevatedSurface
+                            .overlay {
+                                Image(systemName: "film")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.18))
+                            }
+                    }
+                }
+                .frame(width: tileWidth, height: 70)
+                .clipped()
+            }
+        }
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(.white.opacity(0.1))
+                .frame(height: 1)
+        }
+    }
+
+    private var waveform: some View {
+        GeometryReader { geometry in
+            Path { path in
+                let mid = geometry.size.height / 2
+                let bars = TimelineWaveformGeometry.bars(
+                    samples: waveformSamples,
+                    sourceDuration: sourceDuration,
+                    clip: clip,
+                    canvasSize: geometry.size
+                )
+                for bar in bars {
+                    path.move(
+                        to: CGPoint(x: bar.x, y: mid - bar.halfHeight)
+                    )
+                    path.addLine(
+                        to: CGPoint(x: bar.x, y: mid + bar.halfHeight)
+                    )
+                }
+            }
+            .stroke(
+                StudioTheme.accentBright.opacity(0.9),
+                style: StrokeStyle(lineWidth: 1, lineCap: .round)
+            )
+        }
+    }
+
+    private func trimHandle(isLeading: Bool) -> some View {
+        ZStack {
+            UnevenRoundedRectangle(
+                topLeadingRadius: isLeading ? 6 : 2,
+                bottomLeadingRadius: isLeading ? 6 : 2,
+                bottomTrailingRadius: isLeading ? 2 : 6,
+                topTrailingRadius: isLeading ? 2 : 6
+            )
+            .fill(StudioTheme.accentBright)
+
+            Image(systemName: isLeading ? "chevron.right" : "chevron.left")
+                .font(.system(size: 7, weight: .black))
+                .foregroundStyle(StudioTheme.canvas)
+        }
+        .frame(width: 14)
+        .padding(.vertical, 3)
+        .contentShape(Rectangle().inset(by: -7))
+        .highPriorityGesture(trimGesture(isLeading: isLeading))
+        .onHover { hovering in
+            updateTrimCursor(hovering)
+        }
+        .help(isLeading ? "Trim clip start" : "Trim clip end")
+        .accessibilityLabel(isLeading ? "Trim clip start" : "Trim clip end")
+    }
+
+    private func trimGesture(isLeading: Bool) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                onSelect()
+                if isLeading, leadingOrigin == nil {
+                    onEditBegan()
+                    leadingOrigin = TrimOrigin(
+                        sourceTime: clip.sourceStart,
+                        timelineSecondsPerPoint: timelineSecondsPerPoint
+                    )
+                } else if !isLeading, trailingOrigin == nil {
+                    onEditBegan()
+                    trailingOrigin = TrimOrigin(
+                        sourceTime: clip.sourceEnd,
+                        timelineSecondsPerPoint: timelineSecondsPerPoint
+                    )
+                }
+                guard let origin = isLeading
+                    ? leadingOrigin : trailingOrigin else {
+                    return
+                }
+                let sourceDelta = Double(value.translation.width)
+                    * origin.timelineSecondsPerPoint
+                    * clip.playbackRate
+                onTrimChange(isLeading, origin.sourceTime + sourceDelta)
+            }
+            .onEnded { _ in
+                if isLeading {
+                    leadingOrigin = nil
+                } else {
+                    trailingOrigin = nil
+                }
+                onEditEnded()
+            }
+    }
+
+    private func nearestThumbnail(to sourceTime: TimeInterval) -> NSImage? {
+        guard !thumbnails.isEmpty else { return nil }
+        var lower = 0
+        var upper = thumbnails.count - 1
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if thumbnails[middle].sourceTime < sourceTime {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        if lower == 0 { return thumbnails[0].image }
+        let previous = thumbnails[lower - 1]
+        let next = thumbnails[lower]
+        return abs(previous.sourceTime - sourceTime)
+            <= abs(next.sourceTime - sourceTime)
+            ? previous.image : next.image
+    }
+
+    private func updateTrimCursor(_ active: Bool) {
+        if active, !trimCursorPushed {
+            NSCursor.resizeLeftRight.push()
+            trimCursorPushed = true
+        } else if !active, trimCursorPushed {
+            NSCursor.pop()
+            trimCursorPushed = false
+        }
+    }
+}
+
 private struct ZoomRangeBar: View {
     let zoom: ZoomEvent
     let selected: Bool
@@ -1300,7 +1595,7 @@ private struct ZoomRangeBar: View {
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 6)
-                .fill(selected ? Color.purple : Color.purple.opacity(0.62))
+                .fill(selected ? StudioTheme.zoom : StudioTheme.zoom.opacity(0.68))
                 .overlay {
                     RoundedRectangle(cornerRadius: 6)
                         .stroke(
@@ -1491,7 +1786,10 @@ private struct RedactionRangeBar: View {
 
     var body: some View {
         let isSpotlight = redaction.resolvedPresentation == .spotlight
-        let accent = isSpotlight ? Color.orange : Color.red
+        let isBlur = redaction.resolvedEffect == .blur
+        let accent = isSpotlight
+            ? Color.orange
+            : (isBlur ? Color.cyan : Color.red)
         ZStack {
             RoundedRectangle(cornerRadius: 6)
                 .fill(selected ? accent : accent.opacity(0.62))
@@ -1511,9 +1809,13 @@ private struct RedactionRangeBar: View {
                     Image(
                         systemName: isSpotlight
                             ? "light.beacon.max.fill"
-                            : "eye.slash.fill"
+                            : (isBlur ? "drop.fill" : "eye.slash.fill")
                     )
-                    Text(isSpotlight ? "Spotlight" : "Redact")
+                    Text(
+                        isSpotlight
+                            ? "Spotlight"
+                            : (isBlur ? "Blur" : "Redact")
+                    )
                 }
                 .font(.system(size: 9, weight: .semibold))
                 .foregroundStyle(.white)

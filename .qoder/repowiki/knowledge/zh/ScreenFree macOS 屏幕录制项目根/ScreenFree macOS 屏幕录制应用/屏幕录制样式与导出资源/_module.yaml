@@ -1,0 +1,18 @@
+schema_version: 1
+module_path: screenfree_app/styling_resources
+title: 屏幕录制样式与导出资源
+scope:
+    - Sources/ScreenFree/Resources/
+    - Sources/ScreenFree/CanvasStyle.swift
+    - Sources/ScreenFree/CameraOverlayStyle.swift
+    - Sources/ScreenFree/StudioTheme.swift
+    - Sources/ScreenFree/StylePreset.swift
+    - Sources/ScreenFree/CursorArtwork.swift
+    - Sources/ScreenFree/MotionBlur.swift
+    - Sources/ScreenFree/ZoomMotion.swift
+    - Sources/ScreenFree/RecordedAudioLayout.swift
+    - Sources/ScreenFree/TimelineWaveformGeometry.swift
+    - Sources/ScreenFree/ExportOptions.swift
+source_files: []
+depends_on: []
+related_to: []

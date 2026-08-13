@@ -1,0 +1,12 @@
+schema_version: 1
+module_path: screenfree_app/ui_views
+title: 屏幕录制编辑主界面与导出设置
+scope:
+    - Sources/ScreenFree/MainView.swift
+    - Sources/ScreenFree/SettingsView.swift
+    - Sources/ScreenFree/TimelineView.swift
+    - Sources/ScreenFree/ExportSheet.swift
+source_files: []
+depends_on: []
+related_to:
+    - path: screenfree_app/app_core

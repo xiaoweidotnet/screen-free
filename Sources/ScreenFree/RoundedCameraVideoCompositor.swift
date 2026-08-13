@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreImage
+import ScreenFreeCore
 
 final class RoundedCameraCompositionInstruction:
     NSObject,
@@ -12,20 +13,22 @@ final class RoundedCameraCompositionInstruction:
     let requiredSourceTrackIDs: [NSValue]?
     let passthroughTrackID = kCMPersistentTrackID_Invalid
     let screenTrackID: CMPersistentTrackID
-    let cameraTrackID: CMPersistentTrackID
+    let cameraTrackID: CMPersistentTrackID?
     let screenLayerInstruction: AVVideoCompositionLayerInstruction
-    let cameraLayerInstruction: AVVideoCompositionLayerInstruction
+    let cameraLayerInstruction: AVVideoCompositionLayerInstruction?
     let cameraFrame: CGRect
     let cameraCornerRadius: CGFloat
+    let privacyRedactions: [PrivacyRedaction]
 
     init(
         timeRange: CMTimeRange,
         screenTrackID: CMPersistentTrackID,
-        cameraTrackID: CMPersistentTrackID,
+        cameraTrackID: CMPersistentTrackID? = nil,
         screenLayerInstruction: AVVideoCompositionLayerInstruction,
-        cameraLayerInstruction: AVVideoCompositionLayerInstruction,
-        cameraFrame: CGRect,
-        cameraCornerRadius: CGFloat
+        cameraLayerInstruction: AVVideoCompositionLayerInstruction? = nil,
+        cameraFrame: CGRect = .zero,
+        cameraCornerRadius: CGFloat = 0,
+        privacyRedactions: [PrivacyRedaction] = []
     ) {
         self.timeRange = timeRange
         self.screenTrackID = screenTrackID
@@ -34,10 +37,10 @@ final class RoundedCameraCompositionInstruction:
         self.cameraLayerInstruction = cameraLayerInstruction
         self.cameraFrame = cameraFrame
         self.cameraCornerRadius = cameraCornerRadius
-        requiredSourceTrackIDs = [
-            NSNumber(value: screenTrackID),
-            NSNumber(value: cameraTrackID)
-        ]
+        self.privacyRedactions = privacyRedactions
+        requiredSourceTrackIDs = [screenTrackID, cameraTrackID]
+            .compactMap { $0 }
+            .map { NSNumber(value: $0) }
         super.init()
     }
 }
@@ -97,11 +100,11 @@ final class RoundedCameraVideoCompositor:
             .transformed(by: screenTransform)
             .cropped(to: bounds)
 
-        if let cameraBuffer = request.sourceFrame(
-            byTrackID: instruction.cameraTrackID
-        ) {
+        if let cameraTrackID = instruction.cameraTrackID,
+           let cameraLayerInstruction = instruction.cameraLayerInstruction,
+           let cameraBuffer = request.sourceFrame(byTrackID: cameraTrackID) {
             let cameraTransform = transform(
-                from: instruction.cameraLayerInstruction,
+                from: cameraLayerInstruction,
                 at: request.compositionTime
             )
             let camera = CIImage(cvPixelBuffer: cameraBuffer)
@@ -134,6 +137,20 @@ final class RoundedCameraVideoCompositor:
             }
         }
 
+        let timelineTime = request.compositionTime.seconds
+        for redaction in instruction.privacyRedactions where
+            redaction.resolvedPresentation == .redaction
+                && redaction.resolvedEffect == .blur
+                && timelineTime >= redaction.start
+                && timelineTime <= redaction.end
+        {
+            result = applyPrivacyBlur(
+                redaction,
+                to: result,
+                in: bounds
+            )
+        }
+
         context.render(
             result,
             to: destination,
@@ -141,6 +158,60 @@ final class RoundedCameraVideoCompositor:
             colorSpace: CGColorSpaceCreateDeviceRGB()
         )
         request.finish(withComposedVideoFrame: destination)
+    }
+
+    private func applyPrivacyBlur(
+        _ redaction: PrivacyRedaction,
+        to image: CIImage,
+        in bounds: CGRect
+    ) -> CIImage {
+        let width = bounds.width * redaction.normalizedWidth
+        let height = bounds.height * redaction.normalizedHeight
+        let region = CGRect(
+            x: bounds.minX
+                + bounds.width * redaction.normalizedX
+                - width / 2,
+            y: bounds.maxY
+                - bounds.height * redaction.normalizedY
+                - height / 2,
+            width: width,
+            height: height
+        ).intersection(bounds)
+        guard !region.isNull, region.width > 1, region.height > 1 else {
+            return image
+        }
+
+        let radius = redaction.blurRadius(forRenderSize: bounds.size)
+        let blurred = image
+            .clampedToExtent()
+            .applyingFilter(
+                "CIGaussianBlur",
+                parameters: [kCIInputRadiusKey: radius]
+            )
+            .cropped(to: bounds)
+        let black = CIImage(color: .black).cropped(to: bounds)
+        guard let whiteRegion = CIFilter(
+            name: "CIRoundedRectangleGenerator",
+            parameters: [
+                "inputExtent": CIVector(cgRect: region),
+                "inputRadius": min(12, min(region.width, region.height) / 2),
+                "inputColor": CIColor.white
+            ]
+        )?.outputImage else {
+            return image
+        }
+        let mask = whiteRegion
+            .composited(over: black)
+            .cropped(to: bounds)
+        return blurred
+            .applyingFilter(
+                "CIBlendWithMask",
+                parameters: [
+                    kCIInputBackgroundImageKey: image,
+                    kCIInputMaskImageKey: mask
+                ]
+            )
+            .cropped(to: bounds)
     }
 
     private func transform(

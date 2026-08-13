@@ -8,6 +8,90 @@ import XCTest
 import ScreenFreeCore
 
 final class VideoExporterTests: XCTestCase {
+    @MainActor
+    func testCursorPositionMatchesBetweenEditorFrameAndMP4Export() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sourceURL = directory.appendingPathComponent("source.mp4")
+        let cursorURL = directory.appendingPathComponent("cursor.mp4")
+        let cleanURL = directory.appendingPathComponent("clean.mp4")
+        try await makeSyntheticMedia(at: sourceURL)
+
+        let project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 1)],
+            cursorSamples: [
+                CursorSample(time: 0, normalizedX: 0.22, normalizedY: 0.76),
+                CursorSample(time: 1, normalizedX: 0.22, normalizedY: 0.76)
+            ]
+        )
+        var cursorStyle = CanvasRenderStyle.plain
+        cursorStyle.cursorReplacement = .pointer
+        cursorStyle.smoothCursorMovement = false
+        var cleanStyle = cursorStyle
+        cleanStyle.showCursor = false
+
+        let exporter = VideoExporter()
+        let editorFrame = try await exporter.renderFrame(
+            sourceURL: sourceURL,
+            project: project,
+            timelineTime: 0.5,
+            canvasStyle: cursorStyle,
+            frameRate: 30
+        )
+        let cleanEditorFrame = try await exporter.renderFrame(
+            sourceURL: sourceURL,
+            project: project,
+            timelineTime: 0.5,
+            canvasStyle: cleanStyle,
+            frameRate: 30
+        )
+        try await exporter.export(
+            sourceURL: sourceURL,
+            project: project,
+            canvasStyle: cursorStyle,
+            destinationURL: cursorURL,
+            frameRate: 30
+        )
+        try await exporter.export(
+            sourceURL: sourceURL,
+            project: project,
+            canvasStyle: cleanStyle,
+            destinationURL: cleanURL,
+            frameRate: 30
+        )
+
+        let time = CMTime(seconds: 0.5, preferredTimescale: 600)
+        let cursorGenerator = AVAssetImageGenerator(
+            asset: AVURLAsset(url: cursorURL)
+        )
+        cursorGenerator.requestedTimeToleranceBefore = .zero
+        cursorGenerator.requestedTimeToleranceAfter = .zero
+        let cleanGenerator = AVAssetImageGenerator(
+            asset: AVURLAsset(url: cleanURL)
+        )
+        cleanGenerator.requestedTimeToleranceBefore = .zero
+        cleanGenerator.requestedTimeToleranceAfter = .zero
+        let exportedFrame = try await cursorGenerator.image(at: time).image
+        let cleanExportedFrame = try await cleanGenerator.image(at: time).image
+
+        let editorBounds = try XCTUnwrap(
+            differenceBounds(editorFrame, cleanEditorFrame),
+            "The editor frame must contain the editable cursor."
+        )
+        let exportedBounds = try XCTUnwrap(
+            differenceBounds(exportedFrame, cleanExportedFrame),
+            "The exported MP4 must contain the editable cursor."
+        )
+        XCTAssertEqual(editorBounds.midX, exportedBounds.midX, accuracy: 3)
+        XCTAssertEqual(editorBounds.midY, exportedBounds.midY, accuracy: 3)
+    }
+
     func testExportedVideoURLCanBeWrittenToPasteboard() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -266,6 +350,26 @@ final class VideoExporterTests: XCTestCase {
                 )
             ]
         )
+        let subframeGap = 1.0 / 240.0
+        let visuallyAdjacent = TimelineProject(
+            clips: [clip],
+            zooms: [
+                ZoomEvent(
+                    start: 0,
+                    duration: 0.5,
+                    scale: 2,
+                    focusX: 0.72,
+                    focusY: 0.38
+                ),
+                ZoomEvent(
+                    start: 0.5 + subframeGap,
+                    duration: 0.5 - subframeGap,
+                    scale: 2,
+                    focusX: 0.72,
+                    focusY: 0.38
+                )
+            ]
+        )
         var style = CanvasRenderStyle.plain
         style.zoomMotion = .mellow
         let exporter = VideoExporter()
@@ -293,6 +397,35 @@ final class VideoExporterTests: XCTestCase {
             difference / max(1, continuousPixels.count),
             1,
             "Adjacent zooms should export like one continuous zoom at their boundary."
+        )
+
+        let gapTime = 0.5 + subframeGap / 2
+        let continuousGapFrame = try await exporter.renderFrame(
+            sourceURL: sourceURL,
+            project: continuous,
+            timelineTime: gapTime,
+            canvasStyle: style,
+            frameRate: 60
+        )
+        let visuallyAdjacentFrame = try await exporter.renderFrame(
+            sourceURL: sourceURL,
+            project: visuallyAdjacent,
+            timelineTime: gapTime,
+            canvasStyle: style,
+            frameRate: 60
+        )
+        let continuousGapPixels = rgbaPixels(from: continuousGapFrame)
+        let visuallyAdjacentPixels = rgbaPixels(from: visuallyAdjacentFrame)
+        let gapDifference = zip(
+            continuousGapPixels,
+            visuallyAdjacentPixels
+        ).reduce(0) {
+            $0 + abs(Int($1.0) - Int($1.1))
+        }
+        XCTAssertLessThan(
+            gapDifference / max(1, continuousGapPixels.count),
+            1,
+            "A subframe timeline gap must not render an identity-scale flash."
         )
     }
 
@@ -581,7 +714,10 @@ final class VideoExporterTests: XCTestCase {
         let sourceURL = directory.appendingPathComponent("source.mp4")
         let outputURL = directory.appendingPathComponent("redacted.mp4")
         let spotlightURL = directory.appendingPathComponent("spotlight.mp4")
-        try await makeSyntheticMedia(at: sourceURL)
+        try await makeSyntheticMedia(
+            at: sourceURL,
+            highFrequencyPattern: true
+        )
         let project = TimelineProject(
             clips: [TimelineClip(sourceStart: 0, duration: 1)],
             redactions: [
@@ -592,7 +728,8 @@ final class VideoExporterTests: XCTestCase {
                     normalizedY: 0.5,
                     normalizedWidth: 0.32,
                     normalizedHeight: 0.28,
-                    opacity: 1
+                    opacity: 1,
+                    effect: .blur
                 )
             ]
         )
@@ -604,17 +741,46 @@ final class VideoExporterTests: XCTestCase {
             canvasStyle: .plain,
             frameRate: 15
         )
+        let plainFrame = try await exporter.renderFrame(
+            sourceURL: sourceURL,
+            project: TimelineProject(
+                clips: [TimelineClip(sourceStart: 0, duration: 1)]
+            ),
+            timelineTime: 0.4,
+            canvasStyle: .plain,
+            frameRate: 15
+        )
         let currentCenter = pixel(
             in: rgbaPixels(from: currentFrame),
             width: currentFrame.width,
             x: currentFrame.width / 2,
             y: currentFrame.height / 2
         )
-        XCTAssertLessThan(
+        XCTAssertGreaterThan(
             Int(currentCenter.red)
                 + Int(currentCenter.green)
                 + Int(currentCenter.blue),
-            20
+            45,
+            "A privacy mask should blur the source instead of replacing it with a black rectangle."
+        )
+        let currentPixels = rgbaPixels(from: currentFrame)
+        let plainPixelsAtSameTime = rgbaPixels(from: plainFrame)
+        let currentContrast = meanHorizontalContrast(
+            currentPixels,
+            width: currentFrame.width,
+            height: currentFrame.height,
+            normalizedRect: CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2)
+        )
+        let plainContrast = meanHorizontalContrast(
+            plainPixelsAtSameTime,
+            width: plainFrame.width,
+            height: plainFrame.height,
+            normalizedRect: CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2)
+        )
+        XCTAssertLessThan(
+            currentContrast,
+            plainContrast * 0.45,
+            "The active privacy region must remove high-frequency detail in the current-frame renderer."
         )
 
         try await exporter.export(
@@ -647,17 +813,33 @@ final class VideoExporterTests: XCTestCase {
             x: inactiveFrame.width / 2,
             y: inactiveFrame.height / 2
         )
-        XCTAssertLessThan(
+        XCTAssertGreaterThan(
             Int(activeCenter.red)
                 + Int(activeCenter.green)
                 + Int(activeCenter.blue),
-            45
+            45,
+            "The encoded MP4 must contain the same blurred privacy mask as the preview frame."
         )
         XCTAssertGreaterThan(
             Int(inactiveCenter.red)
                 + Int(inactiveCenter.green)
                 + Int(inactiveCenter.blue),
             80
+        )
+        XCTAssertLessThan(
+            meanHorizontalContrast(
+                rgbaPixels(from: activeFrame),
+                width: activeFrame.width,
+                height: activeFrame.height,
+                normalizedRect: CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2)
+            ),
+            meanHorizontalContrast(
+                rgbaPixels(from: inactiveFrame),
+                width: inactiveFrame.width,
+                height: inactiveFrame.height,
+                normalizedRect: CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2)
+            ) * 0.55,
+            "The encoded MP4 must preserve the timed blur instead of only drawing an editor overlay."
         )
 
         let spotlightProject = TimelineProject(
@@ -962,6 +1144,427 @@ final class VideoExporterTests: XCTestCase {
         XCTAssertTrue(restored.project.shortcuts.isEmpty)
         XCTAssertTrue(restored.project.redactions.isEmpty)
         XCTAssertEqual(restored.project.duration, 1, accuracy: 0.001)
+    }
+
+    @MainActor
+    func testOpeningRecordingHistoryRestoresEditableCursorAndZoomMetadata()
+        async throws
+    {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sourceURL = directory.appendingPathComponent("Recording-test.mp4")
+        try await makeSyntheticMedia(at: sourceURL)
+        let cursor = CursorSample(
+            time: 0.5,
+            normalizedX: 0.82,
+            normalizedY: 0.31
+        )
+        let project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 1)],
+            zooms: [
+                ZoomEvent(
+                    start: 0,
+                    duration: 1,
+                    scale: 1.8,
+                    focusX: 0.5,
+                    focusY: 0.5,
+                    followsCursor: true
+                )
+            ],
+            cursorSamples: [cursor]
+        )
+        let snapshot = ScreenFreeProjectSnapshot(
+            version: ScreenFreeProjectSnapshot.currentVersion,
+            sourcePath: sourceURL.path,
+            cameraPath: nil,
+            project: project,
+            canvasAspectRatio: .source,
+            canvasContentMode: .fit,
+            canvasPadding: 0,
+            cornerRadius: 0,
+            backgroundHue: 0.68,
+            backgroundMode: .solid,
+            wallpaperPreset: .aurora,
+            backgroundImagePath: nil,
+            backgroundBlur: 0,
+            shadowStrength: 0,
+            cursorSize: 1.3,
+            cursorReplacement: .arrow,
+            showCursor: true,
+            hideCursorWhenIdle: false,
+            cursorIdleTimeout: 2,
+            cursorTailFreeze: 0,
+            cursorLoopToStart: false,
+            removeCursorShakes: false,
+            cursorShakeThreshold: 0.012,
+            optimizeRapidCursorChanges: false,
+            smoothCursorMovement: true,
+            backgroundMusicPath: nil,
+            backgroundMusicVolume: 0.2,
+            recordedAudioLayout: nil,
+            systemAudioVolume: 1,
+            microphoneAudioVolume: 1,
+            microphoneAudioMuted: false,
+            showClickRipple: true,
+            clickEffectPreset: .ripple,
+            showShortcutOverlay: true,
+            showCaptions: true,
+            captionFontSize: 34,
+            captionLanguage: "zh-CN",
+            captionVocabulary: "",
+            zoomScale: 1.8,
+            zoomDuration: 3.2,
+            zoomMotionPreset: .mellow,
+            zoomCustomTransitionDuration: 0.82,
+            zoomCustomX1: 0.25,
+            zoomCustomY1: 0.1,
+            zoomCustomX2: 0.25,
+            zoomCustomY2: 1,
+            motionBlurEnabled: false,
+            motionBlurStrength: 0.42,
+            cursorMotionBlur: 0.58,
+            zoomMotionBlur: 0.45,
+            panMotionBlur: 0.34,
+            cameraSize: 0.24,
+            cameraCornerRadius: 18,
+            cameraMirrored: true,
+            cameraPosition: .bottomRight,
+            transitionStyle: .fade,
+            transitionDuration: 0.4,
+            updatedAt: Date()
+        )
+        let sidecarURL = RecordingProjectSidecar.url(for: sourceURL)
+        try ProjectPersistence().save(snapshot, to: sidecarURL)
+
+        let store = EditorStore()
+        await store.openRecordingFromHistory(
+            RecordingHistoryItem(
+                url: sourceURL,
+                modifiedAt: Date(),
+                fileSize: 1
+            )
+        )
+
+        XCTAssertEqual(store.project.cursorSamples, [cursor])
+        XCTAssertEqual(store.project.zooms.count, 1)
+        let restoredCursor = try XCTUnwrap(
+            store.project.cursorSample(
+                atTimelineTime: 0.5,
+                freezeBeforeEnd: store.cursorTailFreeze,
+                smoothMovement: store.smoothCursorMovement
+            )
+        )
+        XCTAssertEqual(restoredCursor.normalizedX, 0.82, accuracy: 0.001)
+        XCTAssertEqual(restoredCursor.normalizedY, 0.31, accuracy: 0.001)
+        let zoomState = try XCTUnwrap(store.activeZoomMotion(at: 0.5))
+        let focus = ZoomFocusResolver.focus(
+            at: 0.5,
+            zoomState: zoomState,
+            project: store.project,
+            cursorTailFreeze: store.cursorTailFreeze,
+            cursorLoopToStart: store.cursorLoopToStart,
+            removeCursorShakes: store.removeCursorShakes,
+            cursorShakeThreshold: store.cursorShakeThreshold,
+            optimizeRapidCursorChanges: store.optimizeRapidCursorChanges,
+            smoothCursorMovement: store.smoothCursorMovement
+        )
+        XCTAssertEqual(focus.x, restoredCursor.normalizedX, accuracy: 0.001)
+        XCTAssertEqual(focus.y, restoredCursor.normalizedY, accuracy: 0.001)
+    }
+
+    @MainActor
+    func testRecordingHistoryRecoversCursorFromMP4WhenSidecarIsMissing()
+        async throws
+    {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sourceURL = directory.appendingPathComponent("Recording-test.mp4")
+        try await makeSyntheticMedia(at: sourceURL)
+        let originalDuration = try await AVURLAsset(url: sourceURL)
+            .load(.duration).seconds
+        let cursorSamples = [
+            CursorSample(
+                time: 0.2,
+                normalizedX: 0.24,
+                normalizedY: 0.72
+            ),
+            CursorSample(
+                time: 0.7,
+                normalizedX: 0.78,
+                normalizedY: 0.31
+            )
+        ]
+        let clicks = [
+            MouseClick(
+                time: 0.7,
+                normalizedX: 0.78,
+                normalizedY: 0.31,
+                button: .right,
+                holdDuration: 0.8
+            )
+        ]
+        let shortcuts = [ShortcutEvent(time: 0.4, label: "⌘K")]
+        let archive = RecordingInteractionArchive(
+            cursorSamples: cursorSamples,
+            clicks: clicks,
+            shortcuts: shortcuts
+        )
+        try await RecordingInteractionMetadata.write(
+            archive,
+            to: sourceURL
+        )
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: RecordingProjectSidecar.url(for: sourceURL).path
+            )
+        )
+        let reopenedAsset = AVURLAsset(url: sourceURL)
+        let reopenedVideoTracks = try await reopenedAsset.loadTracks(
+            withMediaType: .video
+        )
+        let reopenedAudioTracks = try await reopenedAsset.loadTracks(
+            withMediaType: .audio
+        )
+        let reopenedDuration = try await reopenedAsset.load(.duration).seconds
+        XCTAssertEqual(reopenedVideoTracks.count, 1)
+        XCTAssertEqual(reopenedAudioTracks.count, 1)
+        XCTAssertEqual(reopenedDuration, originalDuration, accuracy: 0.001)
+
+        let store = EditorStore(
+            recordingHistoryCatalog: RecordingHistoryCatalog(
+                directory: directory
+            )
+        )
+        await store.openRecordingFromHistory(
+            RecordingHistoryItem(
+                url: sourceURL,
+                modifiedAt: Date(),
+                fileSize: 1
+            )
+        )
+
+        XCTAssertEqual(store.project.cursorSamples, cursorSamples)
+        XCTAssertEqual(store.project.clicks, clicks)
+        XCTAssertEqual(store.project.shortcuts, shortcuts)
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: RecordingProjectSidecar.url(for: sourceURL).path
+            ),
+            "Recovered interaction data should immediately receive a new editable sidecar."
+        )
+
+        var cursorStyle = CanvasRenderStyle.plain
+        cursorStyle.showCursor = true
+        let exporter = VideoExporter()
+        let cursorFrame = try await exporter.renderFrame(
+            sourceURL: sourceURL,
+            project: store.project,
+            timelineTime: 0.7,
+            canvasStyle: cursorStyle,
+            frameRate: 30
+        )
+        cursorStyle.showCursor = false
+        let frameWithoutCursor = try await exporter.renderFrame(
+            sourceURL: sourceURL,
+            project: store.project,
+            timelineTime: 0.7,
+            canvasStyle: cursorStyle,
+            frameRate: 30
+        )
+        let difference = zip(
+            rgbaPixels(from: cursorFrame),
+            rgbaPixels(from: frameWithoutCursor)
+        ).reduce(0) {
+            $0 + abs(Int($1.0) - Int($1.1))
+        }
+        XCTAssertGreaterThan(
+            difference,
+            25_000,
+            "Recovered cursor metadata must draw a visible cursor in the real preview renderer."
+        )
+
+        let importedStore = EditorStore()
+        try await importedStore.loadVideo(sourceURL)
+        XCTAssertEqual(importedStore.project.cursorSamples, cursorSamples)
+        XCTAssertEqual(importedStore.project.clicks, clicks)
+        XCTAssertEqual(importedStore.project.shortcuts, shortcuts)
+    }
+
+    @MainActor
+    func testHistoryUsesMatchingRecoveryInsteadOfOverwritingItWithEmptyCursorData()
+        async throws
+    {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sourceURL = directory.appendingPathComponent("Recording-legacy.mp4")
+        try await makeSyntheticMedia(at: sourceURL)
+        let cursor = CursorSample(
+            time: 0.55,
+            normalizedX: 0.63,
+            normalizedY: 0.27
+        )
+        let recoveryURL = directory.appendingPathComponent(
+            "Recovery.screenfree"
+        )
+        let persistence = ProjectPersistence(recoveryURL: recoveryURL)
+        try persistence.save(
+            makeTestSnapshot(
+                sourceURL: sourceURL,
+                project: TimelineProject(
+                    clips: [TimelineClip(sourceStart: 0, duration: 1)],
+                    cursorSamples: [cursor]
+                )
+            ),
+            to: recoveryURL
+        )
+        let sidecarURL = RecordingProjectSidecar.url(for: sourceURL)
+        try persistence.save(
+            makeTestSnapshot(
+                sourceURL: sourceURL,
+                project: TimelineProject(
+                    clips: [TimelineClip(sourceStart: 0, duration: 1)]
+                )
+            ),
+            to: sidecarURL
+        )
+
+        let store = EditorStore(
+            recordingHistoryCatalog: RecordingHistoryCatalog(
+                directory: directory
+            ),
+            persistence: persistence
+        )
+        await store.openRecordingFromHistory(
+            RecordingHistoryItem(
+                url: sourceURL,
+                modifiedAt: Date(),
+                fileSize: 1
+            )
+        )
+
+        XCTAssertEqual(store.project.cursorSamples, [cursor])
+        XCTAssertEqual(
+            try persistence.load(from: sidecarURL).project.cursorSamples,
+            [cursor],
+            "A matching Recovery project must repair the empty sidecar rather than being overwritten by it."
+        )
+    }
+
+    func testSidecarAutosaveCannotReplaceRecordedCursorWithTransientEmptyState()
+        throws
+    {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sourceURL = directory.appendingPathComponent("Recording-safe.mp4")
+        try Data([0]).write(to: sourceURL)
+        let sidecarURL = RecordingProjectSidecar.url(for: sourceURL)
+        let backupURL = RecordingProjectSidecar.backupURL(for: sourceURL)
+        let persistence = ProjectPersistence(
+            recoveryURL: directory.appendingPathComponent(
+                "Recovery.screenfree"
+            )
+        )
+        let cursor = CursorSample(
+            time: 0.4,
+            normalizedX: 0.7,
+            normalizedY: 0.2
+        )
+        try persistence.save(
+            makeTestSnapshot(
+                sourceURL: sourceURL,
+                project: TimelineProject(
+                    clips: [TimelineClip(sourceStart: 0, duration: 1)],
+                    cursorSamples: [cursor]
+                )
+            ),
+            to: sidecarURL
+        )
+        try persistence.savePreservingRecordedInteractions(
+            makeTestSnapshot(
+                sourceURL: sourceURL,
+                project: TimelineProject(
+                    clips: [TimelineClip(sourceStart: 0, duration: 1)]
+                )
+            ),
+            to: sidecarURL,
+            backupURL: backupURL
+        )
+
+        XCTAssertEqual(
+            try persistence.load(from: sidecarURL).project.cursorSamples,
+            [cursor]
+        )
+        XCTAssertEqual(
+            try persistence.load(from: backupURL).project.cursorSamples,
+            [cursor]
+        )
+    }
+
+    @MainActor
+    func testVideoLoadingOnlyKeepsCursorMetadataForRecordingFinalization()
+        async throws
+    {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sourceURL = directory.appendingPathComponent("source.mp4")
+        try await makeSyntheticMedia(at: sourceURL)
+        let capturedCursor = CursorSample(
+            time: 0.4,
+            normalizedX: 0.76,
+            normalizedY: 0.28
+        )
+        let store = EditorStore()
+        store.project = TimelineProject(cursorSamples: [capturedCursor])
+
+        try await store.loadVideo(
+            sourceURL,
+            preservingCapturedMetadata: true
+        )
+        XCTAssertEqual(store.project.cursorSamples, [capturedCursor])
+
+        let staleCursor = CursorSample(
+            time: 0.2,
+            normalizedX: 0.1,
+            normalizedY: 0.9
+        )
+        store.project = TimelineProject(cursorSamples: [staleCursor])
+        try await store.loadVideo(sourceURL)
+
+        XCTAssertTrue(
+            store.project.cursorSamples.isEmpty,
+            "A fresh import or sidecar-less history item must not inherit another video's cursor path."
+        )
     }
 
     @MainActor
@@ -1839,14 +2442,86 @@ final class VideoExporterTests: XCTestCase {
         ) / 3
     }
 
-    private func makeSyntheticMedia(at url: URL) async throws {
+    private func makeTestSnapshot(
+        sourceURL: URL,
+        project: TimelineProject
+    ) -> ScreenFreeProjectSnapshot {
+        ScreenFreeProjectSnapshot(
+            version: ScreenFreeProjectSnapshot.currentVersion,
+            sourcePath: sourceURL.path,
+            cameraPath: nil,
+            project: project,
+            canvasAspectRatio: .source,
+            canvasContentMode: .fit,
+            canvasPadding: 0,
+            cornerRadius: 0,
+            backgroundHue: 0.68,
+            backgroundMode: .solid,
+            wallpaperPreset: .aurora,
+            backgroundImagePath: nil,
+            backgroundBlur: 0,
+            shadowStrength: 0,
+            cursorSize: 1.3,
+            cursorReplacement: .arrow,
+            showCursor: true,
+            hideCursorWhenIdle: false,
+            cursorIdleTimeout: 2,
+            cursorTailFreeze: 0,
+            cursorLoopToStart: false,
+            removeCursorShakes: false,
+            cursorShakeThreshold: 0.012,
+            optimizeRapidCursorChanges: false,
+            smoothCursorMovement: true,
+            backgroundMusicPath: nil,
+            backgroundMusicVolume: 0.2,
+            recordedAudioLayout: nil,
+            systemAudioVolume: 1,
+            microphoneAudioVolume: 1,
+            microphoneAudioMuted: false,
+            showClickRipple: true,
+            clickEffectPreset: .ripple,
+            showShortcutOverlay: true,
+            showCaptions: true,
+            captionFontSize: 34,
+            captionLanguage: "zh-CN",
+            captionVocabulary: "",
+            zoomScale: 1.8,
+            zoomDuration: 3.2,
+            zoomMotionPreset: .mellow,
+            zoomCustomTransitionDuration: 0.82,
+            zoomCustomX1: 0.25,
+            zoomCustomY1: 0.1,
+            zoomCustomX2: 0.25,
+            zoomCustomY2: 1,
+            motionBlurEnabled: false,
+            motionBlurStrength: 0.42,
+            cursorMotionBlur: 0.58,
+            zoomMotionBlur: 0.45,
+            panMotionBlur: 0.34,
+            cameraSize: 0.24,
+            cameraCornerRadius: 18,
+            cameraMirrored: true,
+            cameraPosition: .bottomRight,
+            transitionStyle: .fade,
+            transitionDuration: 0.4,
+            updatedAt: Date()
+        )
+    }
+
+    private func makeSyntheticMedia(
+        at url: URL,
+        highFrequencyPattern: Bool = false
+    ) async throws {
         let videoOnlyURL = url
             .deletingLastPathComponent()
             .appendingPathComponent("video-only.mp4")
         let audioURL = url
             .deletingLastPathComponent()
             .appendingPathComponent("audio.caf")
-        try await makeSyntheticVideoOnly(at: videoOnlyURL)
+        try await makeSyntheticVideoOnly(
+            at: videoOnlyURL,
+            highFrequencyPattern: highFrequencyPattern
+        )
         try makeSilentAudio(at: audioURL)
 
         let videoAsset = AVURLAsset(url: videoOnlyURL)
@@ -1893,7 +2568,8 @@ final class VideoExporterTests: XCTestCase {
 
     private func makeSyntheticVideoOnly(
         at url: URL,
-        solidRGB: (red: UInt8, green: UInt8, blue: UInt8)? = nil
+        solidRGB: (red: UInt8, green: UInt8, blue: UInt8)? = nil,
+        highFrequencyPattern: Bool = false
     ) async throws {
         let width = 320
         let height = 180
@@ -1929,7 +2605,8 @@ final class VideoExporterTests: XCTestCase {
                 width: width,
                 height: height,
                 frameIndex: frameIndex,
-                solidRGB: solidRGB
+                solidRGB: solidRGB,
+                highFrequencyPattern: highFrequencyPattern
             ))
             XCTAssertTrue(
                 adaptor.append(
@@ -1977,7 +2654,8 @@ final class VideoExporterTests: XCTestCase {
         width: Int,
         height: Int,
         frameIndex: Int,
-        solidRGB: (red: UInt8, green: UInt8, blue: UInt8)? = nil
+        solidRGB: (red: UInt8, green: UInt8, blue: UInt8)? = nil,
+        highFrequencyPattern: Bool = false
     ) -> CVPixelBuffer? {
         var pixelBuffer: CVPixelBuffer?
         let status = CVPixelBufferCreate(
@@ -2009,6 +2687,12 @@ final class VideoExporterTests: XCTestCase {
                     row[offset] = solidRGB.blue
                     row[offset + 1] = solidRGB.green
                     row[offset + 2] = solidRGB.red
+                } else if highFrequencyPattern {
+                    let value: UInt8 = ((x / 2 + y / 2) % 2 == 0)
+                        ? 238 : 18
+                    row[offset] = value
+                    row[offset + 1] = value
+                    row[offset + 2] = value
                 } else {
                     row[offset] = UInt8((x + frameIndex * 9) % 255)
                     row[offset + 1] = UInt8((y * 2 + frameIndex * 5) % 255)
@@ -2052,6 +2736,78 @@ final class VideoExporterTests: XCTestCase {
             bytes[offset + 1],
             bytes[offset + 2],
             bytes[offset + 3]
+        )
+    }
+
+    private func meanHorizontalContrast(
+        _ bytes: [UInt8],
+        width: Int,
+        height: Int,
+        normalizedRect: CGRect
+    ) -> Double {
+        let minX = max(1, Int(normalizedRect.minX * Double(width)))
+        let maxX = min(width - 1, Int(normalizedRect.maxX * Double(width)))
+        let minY = max(0, Int(normalizedRect.minY * Double(height)))
+        let maxY = min(height - 1, Int(normalizedRect.maxY * Double(height)))
+        guard minX <= maxX, minY <= maxY else { return 0 }
+        var total = 0.0
+        var count = 0
+        for y in minY...maxY {
+            for x in minX...maxX {
+                let offset = (y * width + x) * 4
+                let previous = offset - 4
+                let value = (
+                    Double(bytes[offset])
+                        + Double(bytes[offset + 1])
+                        + Double(bytes[offset + 2])
+                ) / 3
+                let previousValue = (
+                    Double(bytes[previous])
+                        + Double(bytes[previous + 1])
+                        + Double(bytes[previous + 2])
+                ) / 3
+                total += abs(value - previousValue)
+                count += 1
+            }
+        }
+        return total / Double(max(1, count))
+    }
+
+    private func differenceBounds(
+        _ first: CGImage,
+        _ second: CGImage
+    ) -> CGRect? {
+        guard first.width == second.width, first.height == second.height else {
+            return nil
+        }
+        let firstPixels = rgbaPixels(from: first)
+        let secondPixels = rgbaPixels(from: second)
+        var minX = first.width
+        var minY = first.height
+        var maxX = -1
+        var maxY = -1
+        for y in 0..<first.height {
+            for x in 0..<first.width {
+                let offset = (y * first.width + x) * 4
+                let difference = (0..<3).reduce(0) {
+                    $0 + abs(
+                        Int(firstPixels[offset + $1])
+                            - Int(secondPixels[offset + $1])
+                    )
+                }
+                guard difference > 72 else { continue }
+                minX = min(minX, x)
+                minY = min(minY, y)
+                maxX = max(maxX, x)
+                maxY = max(maxY, y)
+            }
+        }
+        guard maxX >= minX, maxY >= minY else { return nil }
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: maxX - minX + 1,
+            height: maxY - minY + 1
         )
     }
 }

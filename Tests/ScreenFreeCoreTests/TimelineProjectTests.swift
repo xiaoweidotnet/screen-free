@@ -491,6 +491,11 @@ final class TimelineProjectTests: XCTestCase {
             normalizedX: 0.7,
             normalizedY: 0.3
         )
+        XCTAssertEqual(
+            redaction.resolvedEffect,
+            .solid,
+            "Legacy projects without an effect field must preserve the old opaque cover."
+        )
         var project = TimelineProject(
             clips: [TimelineClip(sourceStart: 0, duration: 10)],
             redactions: [redaction]
@@ -578,7 +583,8 @@ final class TimelineProjectTests: XCTestCase {
                     start: 1.3,
                     duration: 0.8,
                     normalizedX: 0.4,
-                    normalizedY: 0.6
+                    normalizedY: 0.6,
+                    effect: .blur
                 )
             ]
         )
@@ -670,6 +676,71 @@ final class TimelineProjectTests: XCTestCase {
         XCTAssertEqual(project.clips[0].duration, 4.5, accuracy: 0.001)
     }
 
+    func testInteractiveTrimEdgesCanContractAndRestoreAvailableSource() throws {
+        let clip = TimelineClip(sourceStart: 0, duration: 10)
+        var project = TimelineProject(clips: [clip])
+
+        XCTAssertTrue(
+            project.setClipSourceStart(
+                clipID: clip.id,
+                to: 2,
+                sourceDuration: 10
+            )
+        )
+        XCTAssertEqual(project.clips[0].sourceStart, 2, accuracy: 0.001)
+        XCTAssertEqual(project.clips[0].sourceEnd, 10, accuracy: 0.001)
+
+        XCTAssertTrue(
+            project.setClipSourceEnd(
+                clipID: clip.id,
+                to: 7,
+                sourceDuration: 10
+            )
+        )
+        XCTAssertEqual(project.clips[0].sourceEnd, 7, accuracy: 0.001)
+
+        XCTAssertTrue(
+            project.setClipSourceStart(
+                clipID: clip.id,
+                to: 0,
+                sourceDuration: 10
+            )
+        )
+        XCTAssertTrue(
+            project.setClipSourceEnd(
+                clipID: clip.id,
+                to: 10,
+                sourceDuration: 10
+            )
+        )
+        XCTAssertEqual(project.clips[0].sourceStart, 0, accuracy: 0.001)
+        XCTAssertEqual(project.clips[0].sourceEnd, 10, accuracy: 0.001)
+    }
+
+    func testInteractiveTrimEdgesStopAtAdjacentClipSourceBoundaries() throws {
+        let first = TimelineClip(sourceStart: 0, duration: 4)
+        let middle = TimelineClip(sourceStart: 4, duration: 3)
+        let last = TimelineClip(sourceStart: 7, duration: 3)
+        var project = TimelineProject(clips: [first, middle, last])
+
+        XCTAssertFalse(
+            project.setClipSourceStart(
+                clipID: middle.id,
+                to: 2,
+                sourceDuration: 10
+            )
+        )
+        XCTAssertFalse(
+            project.setClipSourceEnd(
+                clipID: middle.id,
+                to: 9,
+                sourceDuration: 10
+            )
+        )
+        XCTAssertEqual(project.clips[1].sourceStart, 4, accuracy: 0.001)
+        XCTAssertEqual(project.clips[1].sourceEnd, 7, accuracy: 0.001)
+    }
+
     func testResetTrimRestoresOnlyTheAvailableSourceRange() throws {
         let clip = TimelineClip(
             sourceStart: 0,
@@ -710,13 +781,31 @@ final class TimelineProjectTests: XCTestCase {
         XCTAssertEqual(project.clips[1].sourceStart, 4, accuracy: 0.001)
     }
 
-    func testAutomaticZoomsFollowClicksAndCoalesceBursts() {
+    func testAutomaticZoomsFollowLongRightHoldsAndCoalesceBursts() {
         var project = TimelineProject(
             clips: [TimelineClip(sourceStart: 0, duration: 5)],
             clicks: [
-                MouseClick(time: 1, normalizedX: 0.2, normalizedY: 0.3),
-                MouseClick(time: 1.2, normalizedX: 0.25, normalizedY: 0.35),
-                MouseClick(time: 3, normalizedX: 0.8, normalizedY: 0.7)
+                MouseClick(
+                    time: 1,
+                    normalizedX: 0.2,
+                    normalizedY: 0.3,
+                    button: .right,
+                    holdDuration: 0.6
+                ),
+                MouseClick(
+                    time: 1.2,
+                    normalizedX: 0.25,
+                    normalizedY: 0.35,
+                    button: .right,
+                    holdDuration: 0.6
+                ),
+                MouseClick(
+                    time: 3,
+                    normalizedX: 0.8,
+                    normalizedY: 0.7,
+                    button: .right,
+                    holdDuration: 0.6
+                )
             ]
         )
 
@@ -731,6 +820,50 @@ final class TimelineProjectTests: XCTestCase {
             project.zooms[0].end,
             project.zooms[1].start
         )
+    }
+
+    func testOnlyLongRightMouseHoldCreatesAutomaticZooms() {
+        var project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 8)],
+            clicks: [
+                MouseClick(
+                    time: 1,
+                    normalizedX: 0.1,
+                    normalizedY: 0.2,
+                    button: .left
+                ),
+                MouseClick(
+                    time: 2,
+                    normalizedX: 0.3,
+                    normalizedY: 0.4
+                ),
+                MouseClick(
+                    time: 3,
+                    normalizedX: 0.5,
+                    normalizedY: 0.6,
+                    button: .right,
+                    holdDuration: 0.49
+                ),
+                MouseClick(
+                    time: 5,
+                    normalizedX: 0.75,
+                    normalizedY: 0.35,
+                    button: .right,
+                    holdDuration: 1.2
+                )
+            ]
+        )
+
+        project.generateZoomsFromClicks()
+
+        XCTAssertEqual(
+            project.zooms.count,
+            1,
+            "Only an intentional long right-button hold may create an automatic zoom."
+        )
+        let zoom = try? XCTUnwrap(project.zooms.first)
+        XCTAssertEqual(zoom?.focusX ?? -1, 0.75, accuracy: 0.001)
+        XCTAssertEqual(zoom?.focusY ?? -1, 0.35, accuracy: 0.001)
     }
 
     func testRightMouseHoldKeepsAutomaticZoomActiveUntilRelease() {
@@ -758,7 +891,7 @@ final class TimelineProjectTests: XCTestCase {
         )
     }
 
-    func testRightMouseHoldExtendsANearbyClickZoomUntilRelease() {
+    func testNearbyRightMouseHoldsCoalesceAndExtendUntilRelease() {
         var project = TimelineProject(
             clips: [TimelineClip(sourceStart: 0, duration: 10)],
             clicks: [
@@ -766,7 +899,8 @@ final class TimelineProjectTests: XCTestCase {
                     time: 1,
                     normalizedX: 0.3,
                     normalizedY: 0.4,
-                    button: .left
+                    button: .right,
+                    holdDuration: 0.6
                 ),
                 MouseClick(
                     time: 1.2,
@@ -784,7 +918,7 @@ final class TimelineProjectTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(
             project.zooms[0].end,
             6.8,
-            "A coalesced right hold must extend the active zoom through release."
+            "Coalesced right holds must extend the active zoom through release."
         )
     }
 
@@ -830,7 +964,15 @@ final class TimelineProjectTests: XCTestCase {
         let clip = TimelineClip(sourceStart: 5, duration: 4)
         var project = TimelineProject(
             clips: [clip],
-            clicks: [MouseClick(time: 6, normalizedX: 0.4, normalizedY: 0.6)]
+            clicks: [
+                MouseClick(
+                    time: 6,
+                    normalizedX: 0.4,
+                    normalizedY: 0.6,
+                    button: .right,
+                    holdDuration: 0.6
+                )
+            ]
         )
 
         project.generateZoomsFromClicks()

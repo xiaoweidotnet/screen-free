@@ -350,6 +350,11 @@ struct VideoExporter {
             duration: insertionTime
         )
         var roundedCameraInstruction: RoundedCameraCompositionInstruction?
+        var compositorCameraTrackID: CMPersistentTrackID?
+        var compositorCameraLayerInstruction:
+            AVVideoCompositionLayerInstruction?
+        var compositorCameraFrame = CGRect.zero
+        var compositorCameraCornerRadius: CGFloat = 0
         if let cameraSourceTrack, let cameraCompositionTrack {
             let cameraLayerInstruction = AVMutableVideoCompositionLayerInstruction(
                 assetTrack: cameraCompositionTrack
@@ -432,19 +437,29 @@ struct VideoExporter {
             let cameraRadius = cameraStyle.cornerRadius.clamped(
                 to: 0...min(displayedSize.width, displayedSize.height) / 2
             )
-            if cameraRadius > 0 {
-                roundedCameraInstruction = RoundedCameraCompositionInstruction(
-                    timeRange: instruction.timeRange,
-                    screenTrackID: compositionVideoTrack.trackID,
-                    cameraTrackID: cameraCompositionTrack.trackID,
-                    screenLayerInstruction: layerInstruction,
-                    cameraLayerInstruction: cameraLayerInstruction,
-                    cameraFrame: cameraFrame,
-                    cameraCornerRadius: cameraRadius
-                )
-            }
+            compositorCameraTrackID = cameraCompositionTrack.trackID
+            compositorCameraLayerInstruction = cameraLayerInstruction
+            compositorCameraFrame = cameraFrame
+            compositorCameraCornerRadius = cameraRadius
         } else {
             instruction.layerInstructions = [layerInstruction]
+        }
+
+        let blurRedactions = project.redactions.filter {
+            $0.resolvedPresentation == .redaction
+                && $0.resolvedEffect == .blur
+        }
+        if compositorCameraCornerRadius > 0 || !blurRedactions.isEmpty {
+            roundedCameraInstruction = RoundedCameraCompositionInstruction(
+                timeRange: instruction.timeRange,
+                screenTrackID: compositionVideoTrack.trackID,
+                cameraTrackID: compositorCameraTrackID,
+                screenLayerInstruction: layerInstruction,
+                cameraLayerInstruction: compositorCameraLayerInstruction,
+                cameraFrame: compositorCameraFrame,
+                cameraCornerRadius: compositorCameraCornerRadius,
+                privacyRedactions: blurRedactions
+            )
         }
 
         let videoComposition = AVMutableVideoComposition()
@@ -896,6 +911,12 @@ struct VideoExporter {
         }
 
         for redaction in redactions {
+            if redaction.resolvedPresentation == .redaction,
+               redaction.resolvedEffect == .blur {
+                // Blur masks are already composited by the shared Core Image
+                // video compositor used for current-frame and MP4 rendering.
+                continue
+            }
             let width = videoFrame.width * redaction.normalizedWidth
             let height = videoFrame.height * redaction.normalizedHeight
             let rect = CGRect(
@@ -1433,7 +1454,6 @@ struct VideoExporter {
             || (style.clickEffect != .none && !project.clicks.isEmpty) {
             let cursorClipLayer = CALayer()
             cursorClipLayer.frame = videoLayer.frame
-            cursorClipLayer.isGeometryFlipped = true
             cursorClipLayer.masksToBounds = true
             parentLayer.addSublayer(cursorClipLayer)
             addCursorTrack(
@@ -1547,6 +1567,10 @@ struct VideoExporter {
         videoFrame: CGRect
     ) {
         for redaction in redactions {
+            if redaction.resolvedPresentation == .redaction,
+               redaction.resolvedEffect == .blur {
+                continue
+            }
             let width = videoFrame.width * redaction.normalizedWidth
             let height = videoFrame.height * redaction.normalizedHeight
             let regionFrame = CGRect(
@@ -2219,17 +2243,12 @@ struct VideoExporter {
             return rawPoint
         }
 
-        let zoomFocus = zoomState.zoom.resolvedFollowsCursor
-            ? resolvedZoomFocus(
-                zoomState.zoom,
-                at: time,
-                project: project,
-                style: style
-            )
-            : CGPoint(
-                x: zoomState.focusX,
-                y: zoomState.focusY
-            )
+        let zoomFocus = resolvedZoomFocus(
+            zoomState,
+            at: time,
+            project: project,
+            style: style
+        )
         let focus = point(
             x: zoomFocus.x,
             y: zoomFocus.y,
@@ -2257,26 +2276,23 @@ struct VideoExporter {
     }
 
     private func resolvedZoomFocus(
-        _ zoom: ZoomEvent,
+        _ zoomState: ResolvedZoomMotion,
         at time: TimeInterval,
         project: TimelineProject,
-        style: CanvasRenderStyle
+        style: CanvasRenderStyle,
+        processedCursorSamples: [CursorSample]? = nil
     ) -> CGPoint {
-        guard zoom.resolvedFollowsCursor,
-              let cursor = project.cursorSample(
-                atTimelineTime: time,
-                freezeBeforeEnd: style.cursorTailFreeze,
-                loopToStart: style.cursorLoopToStart,
-                removeShakes: style.removeCursorShakes,
-                shakeThreshold: style.cursorShakeThreshold,
-                optimizeRapidChanges: style.optimizeRapidCursorChanges,
-                smoothMovement: true
-              ) else {
-            return CGPoint(x: zoom.focusX, y: zoom.focusY)
-        }
-        return CGPoint(
-            x: cursor.normalizedX,
-            y: cursor.normalizedY
+        ZoomFocusResolver.focus(
+            at: time,
+            zoomState: zoomState,
+            project: project,
+            cursorTailFreeze: style.cursorTailFreeze,
+            cursorLoopToStart: style.cursorLoopToStart,
+            removeCursorShakes: style.removeCursorShakes,
+            cursorShakeThreshold: style.cursorShakeThreshold,
+            optimizeRapidCursorChanges: style.optimizeRapidCursorChanges,
+            smoothCursorMovement: true,
+            processedCursorSamples: processedCursorSamples
         )
     }
 
@@ -2290,6 +2306,11 @@ struct VideoExporter {
         style: CanvasRenderStyle
     ) {
         let motion = style.zoomMotion
+        let processedCursorSamples = project.processedCursorSamples(
+            removeShakes: style.removeCursorShakes,
+            shakeThreshold: style.cursorShakeThreshold,
+            optimizeRapidChanges: style.optimizeRapidCursorChanges
+        )
         let samplesPerSecond = max(
             15,
             Double(motion.exportSampleCount)
@@ -2365,7 +2386,8 @@ struct VideoExporter {
                         baseTransform: baseTransform,
                         cropGeometry: cropGeometry,
                         project: project,
-                        style: style
+                        style: style,
+                        processedCursorSamples: processedCursorSamples
                     ),
                     toEnd: transform(
                         for: endState,
@@ -2373,7 +2395,8 @@ struct VideoExporter {
                         baseTransform: baseTransform,
                         cropGeometry: cropGeometry,
                         project: project,
-                        style: style
+                        style: style,
+                        processedCursorSamples: processedCursorSamples
                     ),
                     timeRange: CMTimeRange(
                         start: CMTime(
@@ -2412,18 +2435,18 @@ struct VideoExporter {
         baseTransform: CGAffineTransform,
         cropGeometry: CanvasCropGeometry,
         project: TimelineProject,
-        style: CanvasRenderStyle
+        style: CanvasRenderStyle,
+        processedCursorSamples: [CursorSample]
     ) -> CGAffineTransform {
         var result = baseTransform
         if let resolved {
-            let resolvedFocus = resolved.zoom.resolvedFollowsCursor
-                ? resolvedZoomFocus(
-                    resolved.zoom,
-                    at: time,
-                    project: project,
-                    style: style
-                )
-                : CGPoint(x: resolved.focusX, y: resolved.focusY)
+            let resolvedFocus = resolvedZoomFocus(
+                resolved,
+                at: time,
+                project: project,
+                style: style,
+                processedCursorSamples: processedCursorSamples
+            )
             let normalizedFocus = cropGeometry.clampedNormalizedOutputPoint(
                 x: resolvedFocus.x,
                 y: resolvedFocus.y

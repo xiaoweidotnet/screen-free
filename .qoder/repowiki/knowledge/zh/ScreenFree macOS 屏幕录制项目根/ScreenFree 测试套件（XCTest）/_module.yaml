@@ -1,0 +1,10 @@
+schema_version: 1
+module_path: tests
+title: ScreenFree 测试套件（XCTest）
+scope:
+    - Tests/
+source_files: []
+depends_on: []
+related_to:
+    - path: screenfree_app/media_processing
+    - path: screenfree_core

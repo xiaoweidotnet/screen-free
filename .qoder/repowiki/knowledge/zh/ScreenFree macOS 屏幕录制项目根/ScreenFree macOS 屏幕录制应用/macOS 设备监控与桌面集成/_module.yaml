@@ -1,0 +1,10 @@
+schema_version: 1
+module_path: screenfree_app/macos_integration
+title: macOS 设备监控与桌面集成
+scope:
+    - Sources/ScreenFree/DeviceMonitor.swift
+    - Sources/ScreenFree/ShortcutCapture.swift
+    - Sources/ScreenFree/DesktopIconPresentation.swift
+source_files: []
+depends_on: []
+related_to: []

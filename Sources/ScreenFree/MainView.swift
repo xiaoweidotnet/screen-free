@@ -17,6 +17,8 @@ struct MainView: View {
     @State private var previewOwnsNativeFullscreen = false
     @State private var annotationDragStart: CGPoint?
     @State private var annotationDragEnd: CGPoint?
+    @State private var privacyDragStart: CGPoint?
+    @State private var privacyDragEnd: CGPoint?
 
     var body: some View {
         Group {
@@ -26,7 +28,8 @@ struct MainView: View {
                 workstation
             }
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(StudioTheme.canvas)
+        .tint(StudioTheme.accent)
         .preferredColorScheme(.dark)
         .sheet(isPresented: $store.isExportSheetPresented) {
             ExportSheet(store: store)
@@ -48,7 +51,7 @@ struct MainView: View {
             Text(store.localizedErrorMessage ?? "")
         }
         .onDeleteCommand {
-            store.deleteCurrentSelection()
+            _ = store.handleDeleteKey()
         }
         .onReceive(
             NotificationCenter.default.publisher(
@@ -103,6 +106,9 @@ struct MainView: View {
             store.redoTimelineEdit()
             context.isHandled = true
         }
+        .onDisappear {
+            store.editorWindowDidClose()
+        }
     }
 
     private var workstation: some View {
@@ -120,7 +126,7 @@ struct MainView: View {
                     preview
                     playbackBar
                     TimelineView(store: store)
-                        .frame(height: 159)
+                        .frame(height: 253)
                 }
 
                 if showInspector {
@@ -219,11 +225,7 @@ struct MainView: View {
                 Image(systemName: "sparkles.rectangle.stack.fill")
                     .font(.system(size: 19, weight: .semibold))
                     .foregroundStyle(
-                        LinearGradient(
-                            colors: [.purple, .blue],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
+                        StudioTheme.accentGradient
                     )
                 Text("ScreenFree")
                     .font(.system(size: 15, weight: .semibold, design: .rounded))
@@ -307,8 +309,8 @@ struct MainView: View {
             .buttonStyle(
                 AccentButtonStyle(
                     colors: store.isRecording || store.isPreparingRecording
-                        ? [.red, .orange]
-                        : [.purple, .indigo]
+                        ? [StudioTheme.danger, Color(red: 0.65, green: 0.22, blue: 0.22)]
+                        : [StudioTheme.accentBright, StudioTheme.accent]
                 )
             )
 
@@ -317,7 +319,7 @@ struct MainView: View {
             } label: {
                 Label("Export", systemImage: "square.and.arrow.up")
             }
-            .buttonStyle(AccentButtonStyle(colors: [.indigo, .blue]))
+            .buttonStyle(AccentButtonStyle(colors: [StudioTheme.accentBright, StudioTheme.accent]))
             .disabled(store.sourceURL == nil || store.isExporting)
 
             Button {
@@ -334,7 +336,7 @@ struct MainView: View {
         }
         .padding(.horizontal, 16)
         .frame(height: 54)
-        .background(.black.opacity(0.18))
+        .background(StudioTheme.surface)
     }
 
     private var panelRail: some View {
@@ -346,6 +348,10 @@ struct MainView: View {
                     railIcon(
                         symbol: panel.symbol,
                         selected: store.inspectorPanel == panel
+                            && (
+                                panel != .privacy
+                                    || store.activeTimelineTool == .redaction
+                            )
                     )
                 }
                 .buttonStyle(.plain)
@@ -379,15 +385,22 @@ struct MainView: View {
         }
         .padding(.vertical, 12)
         .frame(width: 55)
-        .background(.black.opacity(0.12))
+        .background(StudioTheme.surface.opacity(0.96))
     }
 
     private var primaryRailPanels: [EditorStore.InspectorPanel] {
-        [.recording, .canvas, .cursor, .audio]
+        [.recording, .canvas, .cursor, .audio, .privacy]
     }
 
     private func selectInspectorPanel(_ panel: EditorStore.InspectorPanel) {
-        store.inspectorPanel = panel
+        if panel == .privacy {
+            store.beginPrivacyTool()
+        } else {
+            if store.activeTimelineTool == .redaction {
+                store.cancelTimelineTool()
+            }
+            store.inspectorPanel = panel
+        }
         if !showInspector {
             withAnimation(.easeInOut(duration: 0.2)) {
                 showInspector = true
@@ -409,7 +422,7 @@ struct MainView: View {
                 RoundedRectangle(cornerRadius: 9)
                     .fill(
                         selected
-                            ? Color.purple.opacity(0.78)
+                            ? StudioTheme.accent
                             : Color.clear
                     )
             }
@@ -420,22 +433,35 @@ struct MainView: View {
             let zoomState = store.activeZoomMotion()
             let zoom = zoomState?.zoom
             let scale = zoomState?.scale ?? 1
-            let cursor = store.project.cursorSample(
-                atTimelineTime: store.playhead,
-                freezeBeforeEnd: store.cursorTailFreeze,
-                loopToStart: store.cursorLoopToStart,
+            let processedCursorSamples = store.project.processedCursorSamples(
                 removeShakes: store.removeCursorShakes,
                 shakeThreshold: store.cursorShakeThreshold,
-                optimizeRapidChanges: store.optimizeRapidCursorChanges,
+                optimizeRapidChanges: store.optimizeRapidCursorChanges
+            )
+            let cursor = store.project.cursorSample(
+                atTimelineTime: store.playhead,
+                using: processedCursorSamples,
+                freezeBeforeEnd: store.cursorTailFreeze,
+                loopToStart: store.cursorLoopToStart,
                 smoothMovement: store.smoothCursorMovement
             )
-            let followsCursor = zoom?.resolvedFollowsCursor == true
-            let focusX = followsCursor
-                ? cursor?.normalizedX ?? zoom?.focusX ?? 0.5
-                : zoomState?.focusX ?? zoom?.focusX ?? 0.5
-            let focusY = followsCursor
-                ? cursor?.normalizedY ?? zoom?.focusY ?? 0.5
-                : zoomState?.focusY ?? zoom?.focusY ?? 0.5
+            let zoomFocus = zoomState.map {
+                ZoomFocusResolver.focus(
+                    at: store.playhead,
+                    zoomState: $0,
+                    project: store.project,
+                    cursorTailFreeze: store.cursorTailFreeze,
+                    cursorLoopToStart: store.cursorLoopToStart,
+                    removeCursorShakes: store.removeCursorShakes,
+                    cursorShakeThreshold: store.cursorShakeThreshold,
+                    optimizeRapidCursorChanges:
+                        store.optimizeRapidCursorChanges,
+                    smoothCursorMovement: store.smoothCursorMovement,
+                    processedCursorSamples: processedCursorSamples
+                )
+            }
+            let focusX = zoomFocus?.x ?? zoom?.focusX ?? 0.5
+            let focusY = zoomFocus?.y ?? zoom?.focusY ?? 0.5
             let canvasSize = store.canvasAspectRatio.previewSize(
                 in: geometry.size,
                 sourceAspectRatio: store.sourceAspectRatio
@@ -471,7 +497,11 @@ struct MainView: View {
             let transitionFrame = store.transitionFrame(at: store.playhead)
 
             ZStack {
-                CanvasBackgroundView(store: store)
+                if store.sourceURL != nil {
+                    CanvasBackgroundView(store: store)
+                } else {
+                    StudioTheme.emptyStateBackground
+                }
 
                 if store.sourceURL != nil {
                     NativePlayerView(
@@ -722,6 +752,35 @@ struct MainView: View {
                                             y: store.canvasPadding
                                                 + contentSize.height / 2
                                         )
+                                    } else if redaction.resolvedEffect == .blur {
+                                        PrivacyBlurOverlay(
+                                            player: store.player,
+                                            videoGravity:
+                                                store.canvasContentMode == .fit
+                                                    ? .resizeAspect
+                                                    : .resizeAspectFill,
+                                            region: redaction,
+                                            scale: scale
+                                                * transitionFrame.contentScale,
+                                            anchor: UnitPoint(
+                                                x: mappedFocus.x,
+                                                y: mappedFocus.y
+                                            ),
+                                            cornerRadius: store.cornerRadius,
+                                            selected: redaction.id
+                                                == store.selectedRedactionID
+                                                && store.inspectorPanel == .privacy
+                                        )
+                                        .frame(
+                                            width: contentSize.width,
+                                            height: contentSize.height
+                                        )
+                                        .position(
+                                            x: store.canvasPadding
+                                                + contentSize.width / 2,
+                                            y: store.canvasPadding
+                                                + contentSize.height / 2
+                                        )
                                     } else {
                                         RoundedRectangle(cornerRadius: 8)
                                             .fill(
@@ -756,6 +815,25 @@ struct MainView: View {
                                                         * redaction.normalizedY
                                             )
                                     }
+                                }
+
+                                if let privacyDragStart,
+                                   let privacyDragEnd,
+                                   store.activeTimelineTool == .redaction {
+                                    PrivacyDraftOverlay(
+                                        start: privacyDragStart,
+                                        end: privacyDragEnd
+                                    )
+                                    .frame(
+                                        width: contentSize.width,
+                                        height: contentSize.height
+                                    )
+                                    .position(
+                                        x: store.canvasPadding
+                                            + contentSize.width / 2,
+                                        y: store.canvasPadding
+                                            + contentSize.height / 2
+                                    )
                                 }
 
                                 ForEach(annotations) { annotation in
@@ -834,7 +912,16 @@ struct MainView: View {
                                         (value.location.y - store.canvasPadding)
                                         / contentSize.height
                                     ).clamped(to: 0...1)
-                                    if case .annotation = store.activeTimelineTool {
+                                    if store.activeTimelineTool == .redaction {
+                                        let point = CGPoint(
+                                            x: outputX,
+                                            y: outputY
+                                        )
+                                        if privacyDragStart == nil {
+                                            privacyDragStart = point
+                                        }
+                                        privacyDragEnd = point
+                                    } else if case .annotation = store.activeTimelineTool {
                                         let point = CGPoint(
                                             x: outputX,
                                             y: outputY
@@ -867,6 +954,18 @@ struct MainView: View {
                                     }
                                 }
                                 .onEnded { _ in
+                                    if store.activeTimelineTool == .redaction {
+                                        if let start = privacyDragStart,
+                                           let end = privacyDragEnd {
+                                            store.addRedaction(
+                                                startPoint: start,
+                                                endPoint: end
+                                            )
+                                        }
+                                        privacyDragStart = nil
+                                        privacyDragEnd = nil
+                                        return
+                                    }
                                     guard case let .annotation(kind)
                                         = store.activeTimelineTool else {
                                         store.endContinuousTimelineEdit()
@@ -926,7 +1025,7 @@ struct MainView: View {
                                 Label("Start Recording", systemImage: "record.circle")
                                     .padding(.horizontal, 4)
                             }
-                            .buttonStyle(AccentButtonStyle(colors: [.purple, .indigo]))
+                            .buttonStyle(AccentButtonStyle(colors: [StudioTheme.accentBright, StudioTheme.accent]))
                         }
                     }
                 }
@@ -1068,13 +1167,39 @@ struct MainView: View {
             )
             .disabled(store.sourceURL == nil)
 
+            Button {
+                store.trimAtPlayhead(removingLeft: true)
+            } label: {
+                Label(
+                    "Trim left of playhead",
+                    systemImage: "rectangle.lefthalf.inset.filled"
+                )
+                .labelStyle(.iconOnly)
+            }
+            .buttonStyle(ToolbarButtonStyle())
+            .help("Trim left of playhead")
+            .disabled(!store.canTrimLeftAtPlayhead)
+
+            Button {
+                store.trimAtPlayhead(removingLeft: false)
+            } label: {
+                Label(
+                    "Trim right of playhead",
+                    systemImage: "rectangle.righthalf.inset.filled"
+                )
+                .labelStyle(.iconOnly)
+            }
+            .buttonStyle(ToolbarButtonStyle())
+            .help("Trim right of playhead")
+            .disabled(!store.canTrimRightAtPlayhead)
+
             Text(store.formatted(store.project.duration))
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 18)
         .frame(height: 50)
-        .background(.black.opacity(0.26))
+        .background(StudioTheme.surface)
     }
 
     private var recordingHistoryPopover: some View {
@@ -1232,73 +1357,80 @@ struct MainView: View {
     private func recordingHistoryRow(
         _ item: RecordingHistoryItem
     ) -> some View {
-        Button {
-            if historySelectionMode {
-                toggleHistorySelection(item)
-            } else {
-                showRecordingHistory = false
-                Task { await store.openRecordingFromHistory(item) }
-            }
-        } label: {
-            HStack(spacing: 11) {
+        HStack(spacing: 0) {
+            Button {
                 if historySelectionMode {
-                    Image(
-                        systemName: historySelection.contains(item.id)
-                            ? "checkmark.circle.fill" : "circle"
-                    )
-                    .font(.system(size: 16))
-                    .foregroundStyle(
-                        historySelection.contains(item.id)
-                            ? Color.accentColor : Color.secondary
-                    )
+                    toggleHistorySelection(item)
+                } else {
+                    showRecordingHistory = false
+                    Task { await store.openRecordingFromHistory(item) }
                 }
-
-                Image(systemName: "film.fill")
-                    .font(.system(size: 17))
-                    .foregroundStyle(.purple)
-                    .frame(width: 28, height: 28)
-                    .background(
-                        Color.purple.opacity(0.15),
-                        in: RoundedRectangle(cornerRadius: 7)
-                    )
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(item.displayName)
-                        .font(.system(size: 12, weight: .semibold))
-                        .lineLimit(1)
-                    Text(
-                        "\(item.modifiedAt.formatted(date: .abbreviated, time: .shortened)) · \(ByteCountFormatter.string(fromByteCount: item.fileSize, countStyle: .file))"
-                    )
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                }
-                Spacer()
-                if !historySelectionMode {
-                    Button {
-                        requestHistoryDeletion([item])
-                    } label: {
-                        Image(systemName: "trash")
-                            .font(.system(size: 11))
+            } label: {
+                HStack(spacing: 11) {
+                    if historySelectionMode {
+                        Image(
+                            systemName: historySelection.contains(item.id)
+                                ? "checkmark.circle.fill" : "circle"
+                        )
+                        .font(.system(size: 16))
+                        .foregroundStyle(
+                            historySelection.contains(item.id)
+                                ? Color.accentColor : Color.secondary
+                        )
                     }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
-                    .help("Delete recording")
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.tertiary)
+
+                    Image(systemName: "film.fill")
+                        .font(.system(size: 17))
+                        .foregroundStyle(StudioTheme.accentBright)
+                        .frame(width: 28, height: 28)
+                        .background(
+                            StudioTheme.accentMuted,
+                            in: RoundedRectangle(cornerRadius: 7)
+                        )
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(item.displayName)
+                            .font(.system(size: 12, weight: .semibold))
+                            .lineLimit(1)
+                        Text(
+                            "\(item.modifiedAt.formatted(date: .abbreviated, time: .shortened)) · \(ByteCountFormatter.string(fromByteCount: item.fileSize, countStyle: .file))"
+                        )
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    }
+                    Spacer()
+                    if !historySelectionMode {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                    }
                 }
+                .padding(9)
+                .contentShape(Rectangle())
             }
-            .padding(9)
-            .contentShape(Rectangle())
-            .background(
-                historySelectionMode && historySelection.contains(item.id)
-                    ? Color.accentColor.opacity(0.18)
-                    : Color.white.opacity(0.045),
-                in: RoundedRectangle(cornerRadius: 10)
-            )
+            .buttonStyle(.plain)
+
+            if !historySelectionMode {
+                Button {
+                    requestHistoryDeletion([item])
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 11))
+                        .frame(width: 26, height: 26)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("Delete recording")
+                .padding(.trailing, 6)
+            }
         }
-        .buttonStyle(.plain)
+        .background(
+            historySelectionMode && historySelection.contains(item.id)
+                ? Color.accentColor.opacity(0.18)
+                : Color.white.opacity(0.045),
+            in: RoundedRectangle(cornerRadius: 10)
+        )
         .contextMenu {
             Button {
                 showRecordingHistory = false
@@ -1383,13 +1515,13 @@ struct MainView: View {
             }
             .padding(18)
         }
-        .background(.black.opacity(0.12))
+        .background(StudioTheme.surface.opacity(0.96))
     }
 
     private var statusBar: some View {
         HStack(spacing: 8) {
             Circle()
-                .fill(store.isRecording ? Color.red : Color.green)
+                .fill(store.isRecording ? StudioTheme.danger : StudioTheme.success)
                 .frame(width: 7, height: 7)
             Text(store.localizedStatusMessage)
                 .font(.system(size: 11))
@@ -1401,7 +1533,7 @@ struct MainView: View {
         }
         .padding(.horizontal, 12)
         .frame(height: 27)
-        .background(.black.opacity(0.28))
+        .background(StudioTheme.surface)
     }
 }
 
@@ -1721,7 +1853,7 @@ private struct RecordingInspector: View {
             )
             .toggleStyle(.switch)
 
-            Text("Click metadata is always kept, so automatic zooms can be regenerated later.")
+            Text("Long right-button holds are kept so automatic zooms can be regenerated later.")
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
 
@@ -1800,8 +1932,8 @@ private struct RecordingInspector: View {
             .buttonStyle(
                 AccentButtonStyle(
                     colors: store.isRecording || store.isPreparingRecording
-                        ? [.red, .orange]
-                        : [.purple, .indigo]
+                        ? [StudioTheme.danger, Color(red: 0.65, green: 0.22, blue: 0.22)]
+                        : [StudioTheme.accentBright, StudioTheme.accent]
                 )
             )
         }
@@ -1860,7 +1992,7 @@ private struct DisplayTargetPicker: View {
                                             .font(.system(size: 8, weight: .bold))
                                             .padding(.horizontal, 4)
                                             .padding(.vertical, 2)
-                                            .background(.blue.opacity(0.3), in: Capsule())
+                                            .background(StudioTheme.accentMuted, in: Capsule())
                                     }
                                 }
                                 .font(.system(size: 9, weight: .medium))
@@ -1870,7 +2002,7 @@ private struct DisplayTargetPicker: View {
                                 RoundedRectangle(cornerRadius: 10)
                                     .fill(
                                         store.selectedTargetID == target.id
-                                            ? Color.purple.opacity(0.24)
+                                            ? StudioTheme.accentMuted
                                             : Color.white.opacity(0.035)
                                     )
                             )
@@ -1878,7 +2010,7 @@ private struct DisplayTargetPicker: View {
                                 RoundedRectangle(cornerRadius: 10)
                                     .stroke(
                                         store.selectedTargetID == target.id
-                                            ? Color.purple
+                                            ? StudioTheme.accent
                                             : Color.white.opacity(0.08),
                                         lineWidth: store.selectedTargetID == target.id ? 2 : 1
                                     )
@@ -1904,7 +2036,7 @@ private struct MicrophoneSelectionSheet: View {
             HStack(spacing: 12) {
                 Image(systemName: "mic.badge.plus")
                     .font(.system(size: 24, weight: .medium))
-                    .foregroundStyle(.purple)
+                    .foregroundStyle(StudioTheme.accentBright)
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Choose a microphone")
                         .font(.title2.weight(.semibold))
@@ -1956,7 +2088,7 @@ private struct MicrophoneSelectionSheet: View {
                     )
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(.purple)
+                .tint(StudioTheme.accent)
                 .disabled(store.selectedMicrophoneID == nil)
             }
         }
@@ -2387,115 +2519,131 @@ private struct CursorInspector: View {
 
     var body: some View {
         InspectorSection(title: "Cursor style") {
-            Picker("Cursor replacement", selection: $store.cursorReplacement) {
-                ForEach(CursorReplacementStyle.allCases) { style in
-                    Text(LocalizedStringKey(style.title)).tag(style)
-                }
+            if cursorPathUnavailable {
+                Label(
+                    "Editable cursor data is unavailable for this recording. The original pointer positions cannot be reconstructed.",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
             }
-            .pickerStyle(.segmented)
-            .disabled(!store.showCursor)
-            Toggle("Show cursor", isOn: $store.showCursor)
-                .toggleStyle(.switch)
-            LabeledSlider(
-                title: "Cursor size",
-                value: $store.cursorSize,
-                range: 0.6...2.5,
-                suffix: "×"
-            )
-            Picker("Click effect", selection: $store.clickEffectPreset) {
-                ForEach(ClickEffectPreset.allCases) { effect in
-                    Text(LocalizedStringKey(effect.rawValue)).tag(effect)
-                }
-            }
-            Toggle(
-                "Show shortcut labels",
-                isOn: $store.showShortcutOverlay
-            )
-            .toggleStyle(.switch)
-            if !store.project.shortcuts.isEmpty {
-                HStack {
-                    Text(
-                        L10n.text(
-                            "%d shortcuts recorded",
-                            language: store.appLanguage,
-                            store.project.shortcuts.count
-                        )
-                    )
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Remove shortcut labels") {
-                        store.removeAllShortcuts()
+            Group {
+                Picker("Cursor replacement", selection: $store.cursorReplacement) {
+                    ForEach(CursorReplacementStyle.allCases) { style in
+                        Text(LocalizedStringKey(style.title)).tag(style)
                     }
-                    .font(.system(size: 10))
                 }
-            }
-            Toggle("Hide cursor when idle", isOn: $store.hideCursorWhenIdle)
-                .toggleStyle(.switch)
+                .pickerStyle(.segmented)
                 .disabled(!store.showCursor)
-            if store.hideCursorWhenIdle {
+                Toggle("Show cursor", isOn: $store.showCursor)
+                    .toggleStyle(.switch)
                 LabeledSlider(
-                    title: "Idle timeout",
-                    value: $store.cursorIdleTimeout,
-                    range: 0.5...5,
+                    title: "Cursor size",
+                    value: $store.cursorSize,
+                    range: 0.6...2.5,
+                    suffix: "×"
+                )
+                Picker("Click effect", selection: $store.clickEffectPreset) {
+                    ForEach(ClickEffectPreset.allCases) { effect in
+                        Text(LocalizedStringKey(effect.rawValue)).tag(effect)
+                    }
+                }
+                Toggle(
+                    "Show shortcut labels",
+                    isOn: $store.showShortcutOverlay
+                )
+                .toggleStyle(.switch)
+                if !store.project.shortcuts.isEmpty {
+                    HStack {
+                        Text(
+                            L10n.text(
+                                "%d shortcuts recorded",
+                                language: store.appLanguage,
+                                store.project.shortcuts.count
+                            )
+                        )
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Remove shortcut labels") {
+                            store.removeAllShortcuts()
+                        }
+                        .font(.system(size: 10))
+                    }
+                }
+                Toggle("Hide cursor when idle", isOn: $store.hideCursorWhenIdle)
+                    .toggleStyle(.switch)
+                    .disabled(!store.showCursor)
+                if store.hideCursorWhenIdle {
+                    LabeledSlider(
+                        title: "Idle timeout",
+                        value: $store.cursorIdleTimeout,
+                        range: 0.5...5,
+                        suffix: "s"
+                    )
+                }
+                LabeledSlider(
+                    title: "Stop before end",
+                    value: $store.cursorTailFreeze,
+                    range: 0...5,
                     suffix: "s"
                 )
-            }
-            LabeledSlider(
-                title: "Stop before end",
-                value: $store.cursorTailFreeze,
-                range: 0...5,
-                suffix: "s"
-            )
-            .disabled(!store.showCursor)
-            Text("Set to 0s to keep cursor movement until the final frame.")
-                .font(.system(size: 11))
-                .foregroundStyle(.tertiary)
-            Toggle(
-                "Return cursor to start",
-                isOn: $store.cursorLoopToStart
-            )
-            .toggleStyle(.switch)
-            .disabled(!store.showCursor)
-            Text("Moves the cursor smoothly to its opening position near the end.")
-                .font(.system(size: 11))
-                .foregroundStyle(.tertiary)
-            Toggle(
-                "Remove cursor shakes",
-                isOn: $store.removeCursorShakes
-            )
-            .toggleStyle(.switch)
-            .disabled(!store.showCursor)
-            if store.removeCursorShakes {
-                LabeledSlider(
-                    title: "Shake threshold",
-                    value: $store.cursorShakeThreshold,
-                    range: 0.002...0.08,
-                    suffix: ""
+                .disabled(!store.showCursor)
+                Text("Set to 0s to keep cursor movement until the final frame.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                Toggle(
+                    "Return cursor to start",
+                    isOn: $store.cursorLoopToStart
                 )
+                .toggleStyle(.switch)
+                .disabled(!store.showCursor)
+                Text("Moves the cursor smoothly to its opening position near the end.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                Toggle(
+                    "Remove cursor shakes",
+                    isOn: $store.removeCursorShakes
+                )
+                .toggleStyle(.switch)
+                .disabled(!store.showCursor)
+                if store.removeCursorShakes {
+                    LabeledSlider(
+                        title: "Shake threshold",
+                        value: $store.cursorShakeThreshold,
+                        range: 0.002...0.08,
+                        suffix: ""
+                    )
+                }
+                Toggle(
+                    "Optimize rapid cursor changes",
+                    isOn: $store.optimizeRapidCursorChanges
+                )
+                .toggleStyle(.switch)
+                .disabled(!store.showCursor)
+                Toggle(
+                    "Smooth cursor movement",
+                    isOn: $store.smoothCursorMovement
+                )
+                .toggleStyle(.switch)
+                .disabled(!store.showCursor)
+                Text("Path cleanup is non-destructive and keeps the recorded cursor samples.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                Text("Cursor locations and clicks are captured separately so zooms can be regenerated after recording.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                Text("For privacy, only shortcuts containing Command, Control, or Option are recorded. Ordinary typing is never stored.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
             }
-            Toggle(
-                "Optimize rapid cursor changes",
-                isOn: $store.optimizeRapidCursorChanges
-            )
-            .toggleStyle(.switch)
-            .disabled(!store.showCursor)
-            Toggle(
-                "Smooth cursor movement",
-                isOn: $store.smoothCursorMovement
-            )
-            .toggleStyle(.switch)
-            .disabled(!store.showCursor)
-            Text("Path cleanup is non-destructive and keeps the recorded cursor samples.")
-                .font(.system(size: 11))
-                .foregroundStyle(.tertiary)
-            Text("Cursor locations and clicks are captured separately so zooms can be regenerated after recording.")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-            Text("For privacy, only shortcuts containing Command, Control, or Option are recorded. Ordinary typing is never stored.")
-                .font(.system(size: 11))
-                .foregroundStyle(.tertiary)
+            .disabled(cursorPathUnavailable)
         }
+    }
+
+    private var cursorPathUnavailable: Bool {
+        store.sourceURL != nil && store.project.cursorSamples.isEmpty
     }
 }
 
@@ -2556,7 +2704,7 @@ private struct CaptionsInspector: View {
                 }
                 .frame(maxWidth: .infinity)
             }
-            .buttonStyle(AccentButtonStyle(colors: [.purple, .blue]))
+            .buttonStyle(AccentButtonStyle(colors: [StudioTheme.accentBright, StudioTheme.accent]))
             .disabled(
                 store.sourceURL == nil
                     || store.audioAnalysis.waveform.isEmpty
@@ -2784,7 +2932,7 @@ private struct MiniWaveform: View {
             }
             .stroke(
                 LinearGradient(
-                    colors: [.purple, .blue],
+                    colors: [StudioTheme.accentBright, StudioTheme.accent],
                     startPoint: .leading,
                     endPoint: .trailing
                 ),
@@ -3076,7 +3224,9 @@ private struct ZoomInspector: View {
 
             HStack {
                 Button("Add at playhead") { store.addZoomAtPlayhead() }
-                Button("Auto from clicks") { store.regenerateAutomaticZooms() }
+                Button("Auto from right holds") {
+                    store.regenerateAutomaticZooms()
+                }
             }
             .buttonStyle(ToolbarButtonStyle())
         }
@@ -3198,6 +3348,31 @@ private struct PrivacyInspector: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
 
+            Button {
+                store.beginPrivacyTool()
+            } label: {
+                Label(
+                    store.activeTimelineTool == .redaction
+                        ? "Exit privacy mode"
+                        : "Privacy mode",
+                    systemImage: "eye.slash.fill"
+                )
+            }
+            .buttonStyle(
+                AccentButtonStyle(
+                    colors: [StudioTheme.accentBright, StudioTheme.accent]
+                )
+            )
+            .disabled(store.sourceURL == nil)
+
+            Text(
+                store.activeTimelineTool == .redaction
+                    ? "Drag anywhere on the video to create a timed blur mask. Press Esc to exit."
+                    : "Turn on Privacy mode, then drag over any sensitive area."
+            )
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+
             HStack {
                 Button {
                     store.addRedactionAtPlayhead()
@@ -3223,6 +3398,21 @@ private struct PrivacyInspector: View {
                 Text("Drag the region in the preview or either edge of its timeline bar.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+                if redaction.resolvedPresentation == .redaction {
+                    Picker(
+                        "Privacy effect",
+                        selection: Binding(
+                            get: { redaction.resolvedEffect },
+                            set: {
+                                store.updateSelectedRedaction(effect: $0)
+                            }
+                        )
+                    ) {
+                        Text("Blur").tag(PrivacyRedactionEffect.blur)
+                        Text("Solid cover").tag(PrivacyRedactionEffect.solid)
+                    }
+                    .pickerStyle(.segmented)
+                }
                 LabeledSlider(
                     title: "Width",
                     value: Binding(
@@ -3556,7 +3746,7 @@ private struct ExportInspector: View {
                 }
                 .frame(maxWidth: .infinity)
             }
-            .buttonStyle(AccentButtonStyle(colors: [.indigo, .blue]))
+            .buttonStyle(AccentButtonStyle(colors: [StudioTheme.accentBright, StudioTheme.accent]))
             .disabled(store.sourceURL == nil || store.isExporting)
 
             HStack {
@@ -3678,7 +3868,7 @@ private struct LabeledSlider<V: BinaryFloatingPoint>: View where V.Stride: Binar
                 in: range,
                 onEditingChanged: onEditingChanged
             )
-                .tint(.purple)
+                .tint(StudioTheme.accent)
         }
     }
 }
@@ -3772,6 +3962,100 @@ private struct SpotlightOverlay: View {
     }
 }
 
+private struct PrivacyBlurOverlay: View {
+    let player: AVPlayer
+    let videoGravity: AVLayerVideoGravity
+    let region: PrivacyRedaction
+    let scale: CGFloat
+    let anchor: UnitPoint
+    let cornerRadius: CGFloat
+    let selected: Bool
+
+    var body: some View {
+        GeometryReader { geometry in
+            let size = geometry.size
+            let regionFrame = CGRect(
+                x: size.width
+                    * (region.normalizedX - region.normalizedWidth / 2),
+                y: size.height
+                    * (region.normalizedY - region.normalizedHeight / 2),
+                width: size.width * region.normalizedWidth,
+                height: size.height * region.normalizedHeight
+            )
+            ZStack {
+                NativePlayerView(
+                    player: player,
+                    videoGravity: videoGravity
+                )
+                .disabled(true)
+                .scaleEffect(scale, anchor: anchor)
+                .blur(radius: region.blurRadius(forRenderSize: size))
+                .mask {
+                    RoundedRectangle(cornerRadius: 8)
+                        .frame(
+                            width: regionFrame.width,
+                            height: regionFrame.height
+                        )
+                        .position(
+                            x: regionFrame.midX,
+                            y: regionFrame.midY
+                        )
+                }
+
+                if selected {
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(
+                            Color.cyan.opacity(0.96),
+                            style: StrokeStyle(
+                                lineWidth: 2,
+                                dash: [6, 4]
+                            )
+                        )
+                        .frame(
+                            width: regionFrame.width,
+                            height: regionFrame.height
+                        )
+                        .position(
+                            x: regionFrame.midX,
+                            y: regionFrame.midY
+                        )
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+private struct PrivacyDraftOverlay: View {
+    let start: CGPoint
+    let end: CGPoint
+
+    var body: some View {
+        GeometryReader { geometry in
+            let rect = CGRect(
+                x: min(start.x, end.x) * geometry.size.width,
+                y: min(start.y, end.y) * geometry.size.height,
+                width: abs(end.x - start.x) * geometry.size.width,
+                height: abs(end.y - start.y) * geometry.size.height
+            )
+            RoundedRectangle(cornerRadius: 8)
+                .fill(.white.opacity(0.12))
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(
+                            Color.cyan,
+                            style: StrokeStyle(lineWidth: 2, dash: [7, 4])
+                        )
+                }
+                .frame(width: rect.width, height: rect.height)
+                .position(x: rect.midX, y: rect.midY)
+        }
+        .allowsHitTesting(false)
+    }
+}
+
 private struct FocusReticle: View {
     var body: some View {
         ZStack {
@@ -3779,7 +4063,7 @@ private struct FocusReticle: View {
                 .stroke(.white.opacity(0.95), lineWidth: 1.5)
                 .frame(width: 30, height: 30)
             Circle()
-                .fill(.purple)
+                .fill(StudioTheme.accentBright)
                 .frame(width: 6, height: 6)
         }
         .shadow(color: .black.opacity(0.7), radius: 3)
@@ -3838,6 +4122,8 @@ private struct AccentButtonStyle: ButtonStyle {
                 ),
                 in: RoundedRectangle(cornerRadius: 9)
             )
-            .shadow(color: (colors.first ?? .purple).opacity(0.25), radius: 8, y: 3)
+            .shadow(color: (colors.first ?? StudioTheme.accent).opacity(0.18), radius: 7, y: 3)
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }

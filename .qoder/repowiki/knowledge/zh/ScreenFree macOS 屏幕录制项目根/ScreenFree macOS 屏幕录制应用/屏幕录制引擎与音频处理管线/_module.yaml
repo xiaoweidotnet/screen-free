@@ -1,0 +1,14 @@
+schema_version: 1
+module_path: screenfree_app/recording_engine
+title: 屏幕录制引擎与音频处理管线
+scope:
+    - Sources/ScreenFree/RecordingEngine.swift
+    - Sources/ScreenFree/MicrophoneSignalProcessor.swift
+    - Sources/ScreenFree/AudioAnalyzer.swift
+    - Sources/ScreenFree/RecordingAudioMixer.swift
+    - Sources/ScreenFree/RecordingHistory.swift
+    - Sources/ScreenFree/RecordingSegmentMerger.swift
+source_files: []
+depends_on: []
+related_to:
+    - path: screenfree_app/media_processing

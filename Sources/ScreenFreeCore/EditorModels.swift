@@ -101,7 +101,7 @@ public enum AutomaticZoomTriggerPolicy {
         case .right:
             return (click.holdDuration ?? 0) >= minimumRightHoldDuration
         case .left, nil:
-            return true
+            return false
         }
     }
 }
@@ -185,6 +185,11 @@ public enum TimedRegionPresentation: String, Codable, Sendable {
     case spotlight
 }
 
+public enum PrivacyRedactionEffect: String, Codable, CaseIterable, Sendable {
+    case solid
+    case blur
+}
+
 public struct PrivacyRedaction: Identifiable, Equatable, Codable, Sendable {
     public let id: UUID
     public var start: TimeInterval
@@ -196,6 +201,7 @@ public struct PrivacyRedaction: Identifiable, Equatable, Codable, Sendable {
     public var opacity: CGFloat
     public var presentation: TimedRegionPresentation?
     public var highlightHue: CGFloat?
+    public var effect: PrivacyRedactionEffect?
 
     public init(
         id: UUID = UUID(),
@@ -207,7 +213,8 @@ public struct PrivacyRedaction: Identifiable, Equatable, Codable, Sendable {
         normalizedHeight: CGFloat = 0.16,
         opacity: CGFloat = 0.92,
         presentation: TimedRegionPresentation? = nil,
-        highlightHue: CGFloat? = nil
+        highlightHue: CGFloat? = nil,
+        effect: PrivacyRedactionEffect? = nil
     ) {
         self.id = id
         self.start = start
@@ -219,6 +226,7 @@ public struct PrivacyRedaction: Identifiable, Equatable, Codable, Sendable {
         self.opacity = opacity
         self.presentation = presentation
         self.highlightHue = highlightHue
+        self.effect = effect
     }
 
     public var end: TimeInterval { start + duration }
@@ -227,6 +235,21 @@ public struct PrivacyRedaction: Identifiable, Equatable, Codable, Sendable {
     }
     public var resolvedHighlightHue: CGFloat {
         (highlightHue ?? 0.13).clamped(to: 0...1)
+    }
+    /// Projects created before blur masks existed used an opaque cover.
+    /// Keeping `nil` as solid preserves their appearance while new masks can
+    /// explicitly opt into blur.
+    public var resolvedEffect: PrivacyRedactionEffect {
+        effect ?? .solid
+    }
+
+    /// A render-size-aware blur keeps the privacy mask equally effective in
+    /// the editor, 720p previews, and 4K exports.
+    public func blurRadius(forRenderSize size: CGSize) -> CGFloat {
+        let reference = max(1, min(size.width, size.height))
+        return (
+            reference * (0.008 + opacity.clamped(to: 0...1) * 0.018)
+        ).clamped(to: 6...36)
     }
 }
 
@@ -545,6 +568,59 @@ public struct TimelineProject: Equatable, Codable, Sendable {
         return true
     }
 
+    /// Moves the visible leading source boundary while preserving the clip's
+    /// current trailing boundary. The edge may be dragged back into an
+    /// earlier trim, but never across the preceding clip's source range.
+    @discardableResult
+    public mutating func setClipSourceStart(
+        clipID: UUID,
+        to proposedStart: TimeInterval,
+        sourceDuration: TimeInterval
+    ) -> Bool {
+        guard sourceDuration.isFinite,
+              sourceDuration > 0,
+              let index = clips.firstIndex(where: { $0.id == clipID }) else {
+            return false
+        }
+        let currentEnd = clips[index].sourceEnd
+        let lowerBound = index > 0 ? clips[index - 1].sourceEnd : 0
+        let upperBound = max(lowerBound, currentEnd - 0.1)
+        let newStart = proposedStart.clamped(to: lowerBound...upperBound)
+        guard abs(newStart - clips[index].sourceStart) > 0.000_1 else {
+            return false
+        }
+        clips[index].sourceStart = newStart
+        clips[index].duration = currentEnd - newStart
+        return true
+    }
+
+    /// Moves the visible trailing source boundary while preserving the clip's
+    /// current leading boundary. The edge may restore a previous trim, but
+    /// cannot overlap the following clip or exceed the source asset.
+    @discardableResult
+    public mutating func setClipSourceEnd(
+        clipID: UUID,
+        to proposedEnd: TimeInterval,
+        sourceDuration: TimeInterval
+    ) -> Bool {
+        guard sourceDuration.isFinite,
+              sourceDuration > 0,
+              let index = clips.firstIndex(where: { $0.id == clipID }) else {
+            return false
+        }
+        let currentStart = clips[index].sourceStart
+        let upperBound = index + 1 < clips.count
+            ? clips[index + 1].sourceStart
+            : sourceDuration
+        let lowerBound = min(upperBound, currentStart + 0.1)
+        let newEnd = proposedEnd.clamped(to: lowerBound...upperBound)
+        guard abs(newEnd - clips[index].sourceEnd) > 0.000_1 else {
+            return false
+        }
+        clips[index].duration = newEnd - currentStart
+        return true
+    }
+
     @discardableResult
     public mutating func resetTrim(
         clipID: UUID,
@@ -673,20 +749,19 @@ public struct TimelineProject: Equatable, Codable, Sendable {
               !samples.isEmpty else {
             return nil
         }
-        let sorted = samples.sorted { $0.time < $1.time }
-        guard let first = sorted.first,
-              let last = sorted.last else {
+        guard let first = samples.first,
+              let last = samples.last else {
             return nil
         }
         if sourceTime <= first.time { return first }
         if sourceTime >= last.time { return last }
-        guard let upperIndex = sorted.firstIndex(
+        guard let upperIndex = samples.firstIndex(
             where: { $0.time >= sourceTime }
         ), upperIndex > 0 else {
-            return nearestCursor(to: time, in: sorted)
+            return nearestCursor(to: time, in: samples)
         }
-        let lower = sorted[upperIndex - 1]
-        let upper = sorted[upperIndex]
+        let lower = samples[upperIndex - 1]
+        let upper = samples[upperIndex]
         let interval = upper.time - lower.time
         guard interval > 0 else { return lower }
         let progress = CGFloat(
@@ -716,6 +791,23 @@ public struct TimelineProject: Equatable, Codable, Sendable {
             shakeThreshold: shakeThreshold,
             optimizeRapidChanges: optimizeRapidChanges
         )
+        return cursorSample(
+            atTimelineTime: time,
+            using: samples,
+            freezeBeforeEnd: freezeBeforeEnd,
+            loopToStart: loopToStart,
+            smoothMovement: smoothMovement
+        )
+    }
+
+    public func cursorSample(
+        atTimelineTime time: TimeInterval,
+        using processedSamples: [CursorSample],
+        freezeBeforeEnd: TimeInterval,
+        loopToStart: Bool = false,
+        smoothMovement: Bool = false
+    ) -> CursorSample? {
+        let samples = processedSamples
         let safeTime = time.clamped(to: 0...duration)
         let freezeStart = max(
             0,

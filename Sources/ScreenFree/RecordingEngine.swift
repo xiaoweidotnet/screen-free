@@ -2,6 +2,7 @@ import AVFoundation
 import CoreMedia
 import Foundation
 import ScreenCaptureKit
+import ScreenFreeCore
 
 enum CaptureMode: String, CaseIterable, Identifiable {
     case display = "Display"
@@ -9,6 +10,12 @@ enum CaptureMode: String, CaseIterable, Identifiable {
     case area = "Area"
 
     var id: Self { self }
+}
+
+enum CaptureContentVisibilityPolicy {
+    static func onScreenWindowsOnly(for mode: CaptureMode) -> Bool {
+        mode != .window
+    }
 }
 
 enum SystemAudioCaptureMode: String, CaseIterable, Identifiable, Sendable {
@@ -85,15 +92,20 @@ final class RecordingEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
     func availableTargets(for mode: CaptureMode) async throws -> [CaptureTarget] {
         let content = try await SCShareableContent.excludingDesktopWindows(
             false,
-            onScreenWindowsOnly: true
+            onScreenWindowsOnly: CaptureContentVisibilityPolicy
+                .onScreenWindowsOnly(for: mode)
         )
 
         switch mode {
         case .display, .area:
             return content.displays.enumerated().map { index, display in
-                CaptureTarget(
+                let outputSize = DisplayPixelGeometryResolver.geometry(
+                    displayID: display.displayID,
+                    logicalSize: CGSize(width: display.width, height: display.height)
+                ).fullDisplayOutputSize
+                return CaptureTarget(
                     id: display.displayID,
-                    title: "Display \(index + 1) · \(display.width)×\(display.height)",
+                    title: "Display \(index + 1) · \(Int(outputSize.width))×\(Int(outputSize.height))",
                     kind: .display,
                     frame: display.frame,
                     isPrimary: display.frame.origin == .zero
@@ -185,7 +197,8 @@ final class RecordingEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
     ) async throws {
         let content = try await SCShareableContent.excludingDesktopWindows(
             false,
-            onScreenWindowsOnly: true
+            onScreenWindowsOnly: CaptureContentVisibilityPolicy
+                .onScreenWindowsOnly(for: mode)
         )
 
         let filter: SCContentFilter
@@ -193,6 +206,7 @@ final class RecordingEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
         configuration.queueDepth = 8
+        configuration.captureResolution = .best
         // The cursor is recorded as an editable 30 fps metadata track by
         // EditorStore. Keeping it out of the source video lets the editor
         // resize it, add click effects, and keep it aligned after cuts.
@@ -224,17 +238,21 @@ final class RecordingEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
             )
             sourceFrame = display.frame
             selectedAudioDisplay = display
+            let displayGeometry = DisplayPixelGeometryResolver.geometry(
+                displayID: display.displayID,
+                logicalSize: CGSize(width: display.width, height: display.height)
+            )
 
             if mode == .area {
-                let area = CGRect(
-                    x: CGFloat(display.width) * normalizedArea.minX,
-                    y: CGFloat(display.height) * normalizedArea.minY,
-                    width: CGFloat(display.width) * normalizedArea.width,
-                    height: CGFloat(display.height) * normalizedArea.height
-                ).integral
+                let area = displayGeometry.logicalSourceRect(
+                    normalizedArea: normalizedArea
+                )
+                let outputSize = displayGeometry.areaOutputSize(
+                    forLogicalSourceRect: area
+                )
                 configuration.sourceRect = area
-                configuration.width = max(2, Int(area.width))
-                configuration.height = max(2, Int(area.height))
+                configuration.width = Int(outputSize.width)
+                configuration.height = Int(outputSize.height)
                 sourceFrame = CGRect(
                     x: display.frame.minX + display.frame.width * normalizedArea.minX,
                     y: display.frame.minY + display.frame.height * normalizedArea.minY,
@@ -242,8 +260,9 @@ final class RecordingEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
                     height: display.frame.height * normalizedArea.height
                 )
             } else {
-                configuration.width = display.width
-                configuration.height = display.height
+                let outputSize = displayGeometry.fullDisplayOutputSize
+                configuration.width = Int(outputSize.width)
+                configuration.height = Int(outputSize.height)
             }
 
         case .window:
@@ -257,8 +276,20 @@ final class RecordingEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
             selectedAudioDisplay = content.displays.first {
                 $0.frame.intersects(window.frame)
             } ?? content.displays.first
-            configuration.width = max(2, Int(window.frame.width * 2))
-            configuration.height = max(2, Int(window.frame.height * 2))
+            let displayGeometry = selectedAudioDisplay.map {
+                DisplayPixelGeometryResolver.geometry(
+                    displayID: $0.displayID,
+                    logicalSize: CGSize(width: $0.width, height: $0.height)
+                )
+            } ?? RecordingDisplayGeometry(
+                logicalSize: CGSize(width: 1, height: 1),
+                pixelSize: CGSize(width: 1, height: 1)
+            )
+            let outputSize = displayGeometry.windowOutputSize(
+                forLogicalSize: window.frame.size
+            )
+            configuration.width = Int(outputSize.width)
+            configuration.height = Int(outputSize.height)
         }
 
         let selectedAudioFilter: SCContentFilter?
@@ -291,6 +322,11 @@ final class RecordingEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
                     configuration.width * configuration.height * 4
                 ),
                 AVVideoMaxKeyFrameIntervalKey: 120
+            ],
+            AVVideoColorPropertiesKey: [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
             ]
         ]
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
@@ -471,20 +507,27 @@ final class RecordingEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
             return
         }
         let input: AVAssetWriterInput?
+        var recordingBuffer = sampleBuffer
         switch outputType {
         case .screen:
             input = videoInput
         case .audio:
             input = systemAudioInput
-            _ = systemAudioSignalProcessor?.process(sampleBuffer)
+            if let processed = systemAudioSignalProcessor?
+                .processedSampleBuffer(sampleBuffer) {
+                recordingBuffer = processed
+            }
         case .microphone:
             input = microphoneInput
-            _ = microphoneSignalProcessor?.process(sampleBuffer)
+            if let processed = microphoneSignalProcessor?
+                .processedSampleBuffer(sampleBuffer) {
+                recordingBuffer = processed
+            }
         @unknown default:
             input = nil
         }
         if let input, input.isReadyForMoreMediaData {
-            input.append(sampleBuffer)
+            input.append(recordingBuffer)
         }
     }
 
@@ -663,8 +706,9 @@ private final class SelectedApplicationAudioCapture:
               input.isReadyForMoreMediaData else {
             return
         }
-        _ = signalProcessor?.process(sampleBuffer)
-        input.append(sampleBuffer)
+        let recordingBuffer = signalProcessor?
+            .processedSampleBuffer(sampleBuffer) ?? sampleBuffer
+        input.append(recordingBuffer)
     }
 
     func stream(_ stream: SCStream, didStopWithError error: any Error) {

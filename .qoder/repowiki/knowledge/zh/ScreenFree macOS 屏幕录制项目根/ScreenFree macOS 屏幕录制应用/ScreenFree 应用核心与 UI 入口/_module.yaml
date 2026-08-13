@@ -1,0 +1,13 @@
+schema_version: 1
+module_path: screenfree_app/app_core
+title: ScreenFree 应用核心与 UI 入口
+scope:
+    - Sources/ScreenFree/ScreenFreeApp.swift
+    - Sources/ScreenFree/AreaSelectionCoordinator.swift
+    - Sources/ScreenFree/ProjectPersistence.swift
+    - Sources/ScreenFree/EditorStore.swift
+    - Sources/ScreenFree/Localization.swift
+source_files: []
+depends_on: []
+related_to:
+    - path: screenfree_app/ui_views

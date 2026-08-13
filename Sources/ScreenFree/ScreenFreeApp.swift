@@ -40,57 +40,81 @@ enum ScreenFreeUndoRouting {
 
 final class ScreenFreeAppDelegate: NSObject, NSApplicationDelegate {
     private var keyMonitor: Any?
+    var playbackHandler: (() -> Bool)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         keyMonitor = NSEvent.addLocalMonitorForEvents(
             matching: .keyDown
-        ) { event in
-            if event.keyCode == 53 {
-                let context = ScreenFreeKeyEventContext()
-                NotificationCenter.default.post(
-                    name: .screenFreeEscapePressed,
-                    object: context
-                )
-                return context.isHandled ? nil : event
-            }
-            let modifiers = event.modifierFlags.intersection(
-                .deviceIndependentFlagsMask
+        ) { [weak self] event in
+            guard let self else { return event }
+            let eventWindow = event.window ?? NSApp.keyWindow
+            return routeKeyDown(
+                event,
+                firstResponder: eventWindow?.firstResponder,
+                hasAttachedSheet: eventWindow?.sheetParent != nil
+                    || eventWindow?.attachedSheet != nil
             )
-            let firstResponder = event.window?.firstResponder
-                ?? NSApp.keyWindow?.firstResponder
-            if (event.keyCode == 51 || event.keyCode == 117),
-               !modifiers.contains(.command),
-               !modifiers.contains(.control),
-               !modifiers.contains(.option),
-               ScreenFreeUndoRouting.shouldRouteToTimeline(
-                   firstResponder: firstResponder
-               ) {
-                let context = ScreenFreeKeyEventContext()
-                NotificationCenter.default.post(
-                    name: .screenFreeDeletePressed,
-                    object: context
-                )
-                return context.isHandled ? nil : event
-            }
-            if event.charactersIgnoringModifiers?.lowercased() == "z",
-               modifiers.contains(.control) != modifiers.contains(.command),
-               !modifiers.contains(.option),
-               ScreenFreeUndoRouting.shouldRouteToTimeline(
-                   firstResponder: firstResponder
-               ) {
-                let context = ScreenFreeKeyEventContext()
-                NotificationCenter.default.post(
-                    name: modifiers.contains(.shift)
-                        ? .screenFreeRedoPressed
-                        : .screenFreeUndoPressed,
-                    object: context
-                )
-                return context.isHandled ? nil : event
-            }
-            return event
         }
+    }
+
+    func routeKeyDown(
+        _ event: NSEvent,
+        firstResponder: NSResponder?,
+        hasAttachedSheet: Bool
+    ) -> NSEvent? {
+        if event.keyCode == 53 {
+            let context = ScreenFreeKeyEventContext()
+            NotificationCenter.default.post(
+                name: .screenFreeEscapePressed,
+                object: context
+            )
+            return context.isHandled ? nil : event
+        }
+
+        let modifiers = event.modifierFlags.intersection(
+            .deviceIndependentFlagsMask
+        )
+        if event.keyCode == 49,
+           modifiers.intersection([.command, .control, .option, .shift]).isEmpty,
+           !hasAttachedSheet,
+           ScreenFreeUndoRouting.shouldRouteToTimeline(
+               firstResponder: firstResponder
+           ),
+           playbackHandler?() == true {
+            return nil
+        }
+        if (event.keyCode == 51 || event.keyCode == 117),
+           !modifiers.contains(.command),
+           !modifiers.contains(.control),
+           !modifiers.contains(.option),
+           ScreenFreeUndoRouting.shouldRouteToTimeline(
+               firstResponder: firstResponder
+           ) {
+            let context = ScreenFreeKeyEventContext()
+            NotificationCenter.default.post(
+                name: .screenFreeDeletePressed,
+                object: context
+            )
+            return context.isHandled ? nil : event
+        }
+        if event.charactersIgnoringModifiers?.lowercased() == "z",
+           modifiers.contains(.control) != modifiers.contains(.command),
+           !modifiers.contains(.option),
+           ScreenFreeUndoRouting.shouldRouteToTimeline(
+               firstResponder: firstResponder
+           ) {
+            let context = ScreenFreeKeyEventContext()
+            NotificationCenter.default.post(
+                name: modifiers.contains(.shift)
+                    ? .screenFreeRedoPressed
+                    : .screenFreeUndoPressed,
+                object: context
+            )
+            return context.isHandled ? nil : event
+        }
+        return event
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -118,6 +142,11 @@ struct ScreenFreeApp: App {
             MainView(store: store)
                 .frame(minWidth: 1120, minHeight: 720)
                 .environment(\.locale, store.appLanguage.locale)
+                .onAppear {
+                    appDelegate.playbackHandler = {
+                        store.handlePlaybackKey()
+                    }
+                }
                 .task { await store.prepare() }
                 .onOpenURL { url in
                     Task { await store.openExternalURL(url) }
@@ -169,6 +198,12 @@ struct ScreenFreeApp: App {
                 .disabled(!store.isRecording || store.isTransitioningRecording)
             }
             CommandMenu("Edit Video") {
+                Button(store.isPlaying ? "Pause Playback" : "Play") {
+                    _ = store.handlePlaybackKey()
+                }
+                .keyboardShortcut(.space, modifiers: [])
+                .disabled(store.sourceURL == nil)
+                Divider()
                 Button("Split Tool") { store.toggleSplitTool() }
                     .keyboardShortcut("b", modifiers: [])
                 Button("Exit Editing Tool") {

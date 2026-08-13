@@ -1,0 +1,12 @@
+schema_version: 1
+module_path: ""
+title: ScreenFree macOS 屏幕录制项目根
+scope:
+    - README.md
+    - .gitignore
+    - Package.swift
+    - AGENTS.md
+    - CLAUDE.md
+source_files: []
+depends_on: []
+related_to: []

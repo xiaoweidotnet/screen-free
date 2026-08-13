@@ -60,6 +60,13 @@ final class LocalizationTests: XCTestCase {
             ),
             "录制历史"
         )
+        XCTAssertEqual(
+            L10n.text(
+                "Editable cursor data is unavailable for this recording. The original pointer positions cannot be reconstructed.",
+                language: .simplifiedChinese
+            ),
+            "这段录像的可编辑鼠标轨迹已不可用，无法重建原始鼠标位置。"
+        )
 
         XCTAssertEqual(store.localizedTimelineSummary, "0 个片段 · 0 个缩放")
     }

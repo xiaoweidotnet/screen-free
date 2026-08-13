@@ -76,6 +76,126 @@ final class ZoomMotionTests: XCTestCase {
         )
     }
 
+    func testSubframeGapBetweenAdjacentZoomsNeverReturnsToIdentity() throws {
+        let first = ZoomEvent(
+            start: 1,
+            duration: 2,
+            scale: 1.8,
+            focusX: 0.3,
+            focusY: 0.4
+        )
+        let second = ZoomEvent(
+            start: 3 + 1.0 / 240.0,
+            duration: 2,
+            scale: 1.8,
+            focusX: 0.7,
+            focusY: 0.6
+        )
+
+        let state = try XCTUnwrap(
+            ZoomMotionResolver.state(
+                at: 3 + 1.0 / 480.0,
+                zooms: [first, second],
+                totalDuration: 6,
+                motion: .mellow
+            ),
+            "A visually adjacent subframe gap must be bridged as one continuous zoom."
+        )
+
+        XCTAssertGreaterThanOrEqual(state.scale, 1.79)
+    }
+
+    func testFollowCursorZoomDampsRapidPointerMovement() throws {
+        let zoom = ZoomEvent(
+            start: 0,
+            duration: 3,
+            scale: 1.8,
+            focusX: 0.1,
+            focusY: 0.5,
+            followsCursor: true
+        )
+        let project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 3)],
+            zooms: [zoom],
+            cursorSamples: [
+                CursorSample(time: 0, normalizedX: 0.1, normalizedY: 0.5),
+                CursorSample(time: 1, normalizedX: 0.1, normalizedY: 0.5),
+                CursorSample(time: 1.033, normalizedX: 0.9, normalizedY: 0.5),
+                CursorSample(time: 1.066, normalizedX: 0.9, normalizedY: 0.5),
+                CursorSample(time: 1.6, normalizedX: 0.9, normalizedY: 0.5),
+                CursorSample(time: 2.2, normalizedX: 0.9, normalizedY: 0.5)
+            ]
+        )
+
+        let before = try focus(at: 1, project: project)
+        let immediatelyAfter = try focus(
+            at: 1.033,
+            project: project
+        )
+        let settled = try focus(at: 1.8, project: project)
+
+        XCTAssertLessThan(
+            abs(immediatelyAfter.x - before.x),
+            0.2,
+            "A one-frame pointer jump must not throw the zoomed canvas across the screen."
+        )
+        XCTAssertGreaterThan(
+            settled.x,
+            0.7,
+            "The camera should still follow a sustained intentional move."
+        )
+    }
+
+    func testAdjacentFollowCursorZoomsShareOneStableCameraPath() throws {
+        let first = ZoomEvent(
+            start: 0,
+            duration: 1.5,
+            scale: 1.8,
+            focusX: 0.2,
+            focusY: 0.5,
+            followsCursor: true
+        )
+        let second = ZoomEvent(
+            start: 1.5,
+            duration: 1.5,
+            scale: 1.8,
+            focusX: 0.8,
+            focusY: 0.5,
+            followsCursor: true
+        )
+        let project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 3)],
+            zooms: [first, second],
+            cursorSamples: [
+                CursorSample(time: 0, normalizedX: 0.2, normalizedY: 0.5),
+                CursorSample(time: 1.45, normalizedX: 0.2, normalizedY: 0.5),
+                CursorSample(time: 1.5, normalizedX: 0.8, normalizedY: 0.5),
+                CursorSample(time: 1.55, normalizedX: 0.8, normalizedY: 0.5),
+                CursorSample(time: 2, normalizedX: 0.8, normalizedY: 0.5)
+            ]
+        )
+
+        let beforeBoundary = try focus(at: 1.499, project: project)
+        let afterBoundary = try focus(at: 1.501, project: project)
+
+        XCTAssertLessThan(
+            abs(afterBoundary.x - beforeBoundary.x),
+            0.05,
+            "An adjacent zoom block must not reset the camera-following filter."
+        )
+        XCTAssertGreaterThanOrEqual(
+            try XCTUnwrap(
+                ZoomMotionResolver.state(
+                    at: 1.501,
+                    zooms: project.zooms,
+                    totalDuration: project.duration,
+                    motion: .mellow
+                )
+            ).scale,
+            1.79
+        )
+    }
+
     func testMotionPresetUsesEasedEntryHoldAndExit() throws {
         let zoom = ZoomEvent(
             start: 1,
@@ -222,7 +342,7 @@ final class ZoomMotionTests: XCTestCase {
             smoothCursorMovement: true
         )
         XCTAssertEqual(disabledBlur, .zero)
-        XCTAssertTrue(
+        XCTAssertFalse(
             AutomaticZoomPolicy.shouldGenerate(
                 enabled: true,
                 clicks: [
@@ -233,7 +353,8 @@ final class ZoomMotionTests: XCTestCase {
                         button: .left
                     )
                 ]
-            )
+            ),
+            "A normal left click must not create an automatic zoom."
         )
         XCTAssertFalse(
             AutomaticZoomPolicy.shouldGenerate(
@@ -294,6 +415,31 @@ final class ZoomMotionTests: XCTestCase {
             zooms: [zoom],
             totalDuration: 5,
             preset: preset
+        )
+    }
+
+    private func focus(
+        at time: TimeInterval,
+        project: TimelineProject
+    ) throws -> CGPoint {
+        let state = try XCTUnwrap(
+            ZoomMotionResolver.state(
+                at: time,
+                zooms: project.zooms,
+                totalDuration: project.duration,
+                motion: .mellow
+            )
+        )
+        return ZoomFocusResolver.focus(
+            at: time,
+            zoomState: state,
+            project: project,
+            cursorTailFreeze: 0,
+            cursorLoopToStart: false,
+            removeCursorShakes: true,
+            cursorShakeThreshold: 0.012,
+            optimizeRapidCursorChanges: true,
+            smoothCursorMovement: true
         )
     }
 }

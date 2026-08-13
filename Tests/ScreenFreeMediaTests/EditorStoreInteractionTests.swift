@@ -5,6 +5,39 @@ import XCTest
 
 @MainActor
 final class EditorStoreInteractionTests: XCTestCase {
+    func testStoppedCursorCaptureSessionRejectsQueuedSamples() {
+        let activeSessionID = UUID()
+
+        XCTAssertTrue(
+            CursorCaptureGate.allows(
+                callbackSessionID: activeSessionID,
+                activeSessionID: activeSessionID,
+                isRecording: true,
+                isPaused: false,
+                isTransitioning: false
+            )
+        )
+        XCTAssertFalse(
+            CursorCaptureGate.allows(
+                callbackSessionID: activeSessionID,
+                activeSessionID: nil,
+                isRecording: true,
+                isPaused: false,
+                isTransitioning: false
+            ),
+            "A timer callback already queued before Stop must not append a cursor sample afterward."
+        )
+        XCTAssertFalse(
+            CursorCaptureGate.allows(
+                callbackSessionID: activeSessionID,
+                activeSessionID: activeSessionID,
+                isRecording: true,
+                isPaused: false,
+                isTransitioning: true
+            )
+        )
+    }
+
     func testTimelineUndoRoutingDefersToEditableTextResponders() {
         let textView = NSTextView()
         textView.isEditable = true
@@ -26,6 +59,115 @@ final class EditorStoreInteractionTests: XCTestCase {
                 firstResponder: NSButton()
             )
         )
+    }
+
+    func testSpacePlaybackHandlerTogglesOnlyAnEditableVideoTimeline() {
+        let store = EditorStore()
+
+        XCTAssertFalse(store.handlePlaybackKey())
+
+        store.sourceURL = URL(fileURLWithPath: "/tmp/space-shortcut.mov")
+        store.project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 5)]
+        )
+
+        XCTAssertTrue(store.handlePlaybackKey())
+        XCTAssertTrue(store.isPlaying)
+        XCTAssertTrue(store.handlePlaybackKey())
+        XCTAssertFalse(store.isPlaying)
+    }
+
+    func testAppDelegateRoutesSpaceDirectlyToPlaybackHandler() throws {
+        let appDelegate = ScreenFreeAppDelegate()
+        var invocationCount = 0
+        appDelegate.playbackHandler = {
+            invocationCount += 1
+            return true
+        }
+        let event = try XCTUnwrap(
+            NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: [],
+                timestamp: 0,
+                windowNumber: 0,
+                context: nil,
+                characters: " ",
+                charactersIgnoringModifiers: " ",
+                isARepeat: false,
+                keyCode: 49
+            )
+        )
+
+        XCTAssertNil(
+            appDelegate.routeKeyDown(
+                event,
+                firstResponder: NSButton(),
+                hasAttachedSheet: false
+            )
+        )
+        XCTAssertEqual(invocationCount, 1)
+    }
+
+    func testAppDelegateLeavesSpaceForEditableTextAndUnhandledPlayback() throws {
+        let appDelegate = ScreenFreeAppDelegate()
+        var invocationCount = 0
+        appDelegate.playbackHandler = {
+            invocationCount += 1
+            return false
+        }
+        let event = try XCTUnwrap(
+            NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: [],
+                timestamp: 0,
+                windowNumber: 0,
+                context: nil,
+                characters: " ",
+                charactersIgnoringModifiers: " ",
+                isARepeat: false,
+                keyCode: 49
+            )
+        )
+        let textView = NSTextView()
+        textView.isEditable = true
+
+        XCTAssertNotNil(
+            appDelegate.routeKeyDown(
+                event,
+                firstResponder: textView,
+                hasAttachedSheet: false
+            )
+        )
+        XCTAssertEqual(invocationCount, 0)
+        XCTAssertNotNil(
+            appDelegate.routeKeyDown(
+                event,
+                firstResponder: NSButton(),
+                hasAttachedSheet: false
+            )
+        )
+        XCTAssertEqual(invocationCount, 1)
+    }
+
+    func testClosingTheEditorWindowStopsPlaybackWithoutDiscardingTheProject() {
+        let store = EditorStore()
+        let sourceURL = URL(fileURLWithPath: "/tmp/window-close-playback.mov")
+        let project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 5)]
+        )
+        store.sourceURL = sourceURL
+        store.project = project
+
+        XCTAssertTrue(store.handlePlaybackKey())
+        XCTAssertTrue(store.isPlaying)
+
+        store.editorWindowDidClose()
+
+        XCTAssertFalse(store.isPlaying)
+        XCTAssertEqual(store.sourceURL, sourceURL)
+        XCTAssertEqual(store.project, project)
     }
 
     func testRecordingDefaultsIncludeSystemAudioAndMicrophone() {
@@ -420,6 +562,7 @@ final class EditorStoreInteractionTests: XCTestCase {
 
         store.setHoveredClip(atTimelineTime: 1)
         XCTAssertEqual(store.hoveredTimelineBlock, .clip(first.id))
+        XCTAssertEqual(store.selectedClipID, first.id)
         XCTAssertTrue(store.handleDeleteKey())
 
         XCTAssertEqual(store.project.clips.map(\.id), [second.id, third.id])
@@ -430,9 +573,45 @@ final class EditorStoreInteractionTests: XCTestCase {
         store.undoTimelineEdit()
 
         XCTAssertEqual(store.project, originalProject)
-        XCTAssertEqual(store.selectedClipID, third.id)
+        XCTAssertEqual(store.selectedClipID, first.id)
         XCTAssertEqual(store.playhead, 5.5, accuracy: 0.001)
         XCTAssertEqual(store.activeTimelineTool, .split)
+    }
+
+    func testHoveringAClipMakesItTheVisibleAndKeyboardDeleteTarget() {
+        let store = EditorStore()
+        let clipA = TimelineClip(sourceStart: 0, duration: 2)
+        let clipB = TimelineClip(sourceStart: 2, duration: 2)
+        let clipC = TimelineClip(sourceStart: 4, duration: 2)
+        store.project = TimelineProject(clips: [clipA, clipB, clipC])
+        store.selectedClipID = clipC.id
+        store.inspectorPanel = .clip
+
+        store.setHoveredTimelineBlock(.clip(clipA.id), hovering: true)
+
+        XCTAssertEqual(
+            store.selectedClipID,
+            clipA.id,
+            "The blue selection and Delete target must follow the clip under the pointer."
+        )
+        XCTAssertEqual(store.hoveredTimelineBlock, .clip(clipA.id))
+        store.setHoveredTimelineBlock(.clip(clipA.id), hovering: false)
+        XCTAssertNil(store.hoveredTimelineBlock)
+        XCTAssertTrue(store.handleDeleteKey())
+        XCTAssertEqual(store.project.clips.map(\.id), [clipB.id, clipC.id])
+    }
+
+    func testContextMenuDeleteRemovesTheRequestedClipInsteadOfAStaleSelection() {
+        let store = EditorStore()
+        let clipA = TimelineClip(sourceStart: 0, duration: 2)
+        let clipB = TimelineClip(sourceStart: 2, duration: 2)
+        let clipC = TimelineClip(sourceStart: 4, duration: 2)
+        store.project = TimelineProject(clips: [clipA, clipB, clipC])
+        store.selectedClipID = clipC.id
+
+        XCTAssertTrue(store.deleteClip(id: clipA.id))
+
+        XCTAssertEqual(store.project.clips.map(\.id), [clipB.id, clipC.id])
     }
 
     func testSplitUndoAndRedoAreSingleAtomicTimelineEdits() {
@@ -487,6 +666,51 @@ final class EditorStoreInteractionTests: XCTestCase {
             1
         )
         XCTAssertEqual(store.timelineUndoTitle, "Undo Split Clip")
+    }
+
+    func testContinuousEdgeTrimCreatesOneUndoAndRestoresTheClip() {
+        let store = EditorStore()
+        let clip = TimelineClip(sourceStart: 0, duration: 10)
+        store.sourceDuration = 10
+        store.project = TimelineProject(clips: [clip])
+        store.selectedClipID = clip.id
+
+        store.beginContinuousTimelineEdit(.clip)
+        store.setClipTrimEdge(clipID: clip.id, isLeading: true, sourceTime: 1)
+        store.setClipTrimEdge(clipID: clip.id, isLeading: true, sourceTime: 2)
+        store.setClipTrimEdge(clipID: clip.id, isLeading: false, sourceTime: 8)
+        store.endContinuousTimelineEdit()
+
+        XCTAssertEqual(store.project.clips[0].sourceStart, 2, accuracy: 0.001)
+        XCTAssertEqual(store.project.clips[0].sourceEnd, 8, accuracy: 0.001)
+        XCTAssertEqual(store.timelineUndoTitle, "Undo Edit Clip")
+
+        store.undoTimelineEdit()
+
+        XCTAssertEqual(store.project.clips[0], clip)
+    }
+
+    func testPlayheadTrimRemovesEitherSideAndCanUndo() {
+        let store = EditorStore()
+        let clip = TimelineClip(sourceStart: 0, duration: 10)
+        store.sourceDuration = 10
+        store.project = TimelineProject(clips: [clip])
+        store.selectedClipID = clip.id
+        store.playhead = 4
+
+        XCTAssertTrue(store.canTrimLeftAtPlayhead)
+        XCTAssertTrue(store.canTrimRightAtPlayhead)
+        store.trimAtPlayhead(removingLeft: true)
+
+        XCTAssertEqual(store.project.clips[0].sourceStart, 4, accuracy: 0.001)
+        XCTAssertEqual(store.timelineUndoTitle, "Undo Trim Clip Left")
+
+        store.undoTimelineEdit()
+        store.playhead = 4
+        store.trimAtPlayhead(removingLeft: false)
+
+        XCTAssertEqual(store.project.clips[0].sourceEnd, 4, accuracy: 0.001)
+        XCTAssertEqual(store.timelineUndoTitle, "Undo Trim Clip Right")
     }
 
     func testAClipAdjustmentAfterUndoClearsRedoImmediately() {
@@ -619,6 +843,42 @@ final class EditorStoreInteractionTests: XCTestCase {
 
         XCTAssertEqual(store.project.redactions, [redaction])
         XCTAssertEqual(store.project.annotations, [annotation])
+    }
+
+    func testPrivacyModeDragCreatesBlurRegionAtChosenBounds() throws {
+        let store = EditorStore()
+        store.sourceURL = URL(fileURLWithPath: "/tmp/privacy-drag.mp4")
+        store.project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 8)]
+        )
+        store.playhead = 2
+
+        store.beginPrivacyTool()
+        store.addRedaction(
+            startPoint: CGPoint(x: 0.2, y: 0.3),
+            endPoint: CGPoint(x: 0.7, y: 0.8)
+        )
+
+        let region = try XCTUnwrap(store.project.redactions.first)
+        XCTAssertEqual(region.normalizedX, 0.45, accuracy: 0.001)
+        XCTAssertEqual(region.normalizedY, 0.55, accuracy: 0.001)
+        XCTAssertEqual(region.normalizedWidth, 0.5, accuracy: 0.001)
+        XCTAssertEqual(region.normalizedHeight, 0.5, accuracy: 0.001)
+        XCTAssertEqual(region.start, 2, accuracy: 0.001)
+        XCTAssertEqual(region.duration, 3, accuracy: 0.001)
+        XCTAssertEqual(store.selectedRedactionID, region.id)
+        XCTAssertEqual(store.inspectorPanel, .privacy)
+        XCTAssertEqual(store.activeTimelineTool, .redaction)
+    }
+
+    func testPrivacyModeStaysInactiveUntilAVideoIsOpen() {
+        let store = EditorStore()
+
+        store.beginPrivacyTool()
+
+        XCTAssertEqual(store.inspectorPanel, .privacy)
+        XCTAssertEqual(store.activeTimelineTool, .selection)
+        XCTAssertTrue(store.project.redactions.isEmpty)
     }
 
     func testSplitToolStaysActiveAcrossPointSplitsAndEscapeCancelsIt() {
