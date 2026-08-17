@@ -1,4 +1,5 @@
 import AppKit
+import ScreenFreeCore
 import SwiftUI
 
 @MainActor
@@ -7,6 +8,7 @@ final class RecordingWindowCoordinator {
     private var panel: RecordingControlPanel?
     private var countdownPanel: RecordingCountdownPanel?
     private var highlightPanel: RecordingHighlightPanel?
+    private var drawingPanel: RecordingDrawingPanel?
     private var speakerNotesPanel: RecordingSpeakerNotesPanel?
     private var hiddenWindows: [NSWindow] = []
     private var applicationPresentation = RecordingApplicationPresentation()
@@ -29,7 +31,7 @@ final class RecordingWindowCoordinator {
             let rootView = RecordingControlView(store: store)
                 .environment(\.locale, store.appLanguage.locale)
             let panel = RecordingControlPanel(
-                contentRect: NSRect(x: 0, y: 0, width: 470, height: 72),
+                contentRect: NSRect(x: 0, y: 0, width: 640, height: 110),
                 styleMask: [.borderless, .nonactivatingPanel],
                 backing: .buffered,
                 defer: false
@@ -76,6 +78,7 @@ final class RecordingWindowCoordinator {
         panel?.orderOut(nil)
         countdownPanel?.orderOut(nil)
         highlightPanel?.orderOut(nil)
+        drawingPanel?.orderOut(nil)
         speakerNotesPanel?.orderOut(nil)
         desktopIconController.finish()
         if let policy = applicationPresentation.finish() {
@@ -231,6 +234,47 @@ final class RecordingWindowCoordinator {
         highlightPanel?.orderFrontRegardless()
     }
 
+    func updateDrawingOverlay(frame: CGRect, visible: Bool) {
+        guard visible, frame.width > 1, frame.height > 1, let store else {
+            drawingPanel?.orderOut(nil)
+            return
+        }
+        if drawingPanel == nil {
+            let drawingView = RecordingDrawingView(store: store)
+            let panel = RecordingDrawingPanel(
+                contentRect: .zero,
+                styleMask: [.borderless, .nonactivatingPanel],
+                backing: .buffered,
+                defer: false
+            )
+            panel.contentView = drawingView
+            panel.backgroundColor = .clear
+            panel.isOpaque = false
+            panel.hasShadow = false
+            panel.level = .floating
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            panel.hidesOnDeactivate = false
+            panel.ignoresMouseEvents = true
+            drawingPanel = panel
+        }
+        let mainDisplayHeight = NSScreen.screens.first(where: {
+            ($0.deviceDescription[
+                NSDeviceDescriptionKey("NSScreenNumber")
+            ] as? NSNumber)?.uint32Value == CGMainDisplayID()
+        })?.frame.height ?? NSScreen.screens.first?.frame.height ?? frame.height
+        let appKitFrame = RecordingHighlightGeometry.appKitFrame(
+            forQuartzFrame: frame,
+            mainDisplayHeight: mainDisplayHeight
+        )
+        drawingPanel?.setFrame(appKitFrame, display: true)
+        drawingPanel?.orderFrontRegardless()
+        updateDrawingInteraction()
+    }
+
+    func updateDrawingInteraction() {
+        drawingPanel?.ignoresMouseEvents = (store?.recordingDrawingTool == nil)
+    }
+
     private func screen(for displayID: UInt32?) -> NSScreen? {
         guard let displayID else { return nil }
         return NSScreen.screens.first {
@@ -341,6 +385,169 @@ private final class RecordingHighlightPanel: NSPanel {
     override var canBecomeKey: Bool { false }
 }
 
+private final class RecordingDrawingPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+}
+
+/// A transparent click-through canvas over the recorded area. While a drawing
+/// tool is armed it captures one drag (a single stroke), then returns to
+/// click-through on mouse-up. It renders the in-progress draft and any
+/// annotation still inside its fade window so the user sees exactly what will
+/// be composited into the output.
+private final class RecordingDrawingView: NSView {
+    weak var store: EditorStore?
+
+    private var draftKind: AnnotationKind?
+    private var draftStart: NormalizedPoint?
+    private var draftEnd: NormalizedPoint?
+    private var draftPoints: [NormalizedPoint] = []
+    private var strokeBeganAt: TimeInterval?
+    private var fadeTimer: Timer?
+
+    init(store: EditorStore) {
+        self.store = store
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+    }
+
+    override var isOpaque: Bool { false }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard fadeTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.1, repeats: true) {
+            [weak self] _ in
+            self?.needsDisplay = true
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        fadeTimer = timer
+    }
+
+    deinit {
+        fadeTimer?.invalidate()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let store, let kind = store.recordingDrawingTool,
+              let point = store.normalizedDrawingPoint() else {
+            return
+        }
+        draftKind = kind
+        draftStart = point
+        draftEnd = point
+        draftPoints = [point]
+        strokeBeganAt = store.currentRecordingElapsed
+        needsDisplay = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let store, draftKind != nil,
+              let point = store.normalizedDrawingPoint() else {
+            return
+        }
+        if draftKind == .brush {
+            draftPoints.append(point)
+        } else {
+            draftEnd = point
+        }
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let store, let kind = draftKind else { return }
+        let start = draftStart
+            ?? store.normalizedDrawingPoint()
+            ?? NormalizedPoint(x: 0.5, y: 0.5)
+        let end = draftEnd ?? start
+        let beganAt = strokeBeganAt ?? store.currentRecordingElapsed
+        store.commitRecordingAnnotation(
+            kind: kind,
+            points: kind == .brush ? draftPoints : [],
+            start: start,
+            end: end,
+            strokeBeganAt: beganAt,
+            strokeEndedAt: store.currentRecordingElapsed
+        )
+        resetDraft()
+        store.recordingDrawingTool = nil
+        needsDisplay = true
+    }
+
+    private func resetDraft() {
+        draftKind = nil
+        draftStart = nil
+        draftEnd = nil
+        draftPoints = []
+        strokeBeganAt = nil
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let store,
+              let context = NSGraphicsContext.current?.cgContext else {
+            return
+        }
+        context.clear(bounds)
+
+        let now = store.recordingElapsed
+        for annotation in store.project.annotations {
+            guard now >= annotation.start, now <= annotation.end else {
+                continue
+            }
+            stroke(
+                annotation,
+                progress: annotation.drawProgress(atSourceTime: now),
+                in: context
+            )
+        }
+
+        if let kind = draftKind {
+            stroke(
+                Annotation(
+                    kind: kind,
+                    start: now,
+                    points: kind == .brush ? draftPoints : [],
+                    normalizedStartX: draftStart?.x ?? 0,
+                    normalizedStartY: draftStart?.y ?? 0,
+                    normalizedEndX: draftEnd?.x ?? draftStart?.x ?? 0,
+                    normalizedEndY: draftEnd?.y ?? draftStart?.y ?? 0,
+                    lineWidth: store.recordingAnnotationLineWidth,
+                    color: store.recordingAnnotationColor
+                ),
+                in: context
+            )
+        }
+    }
+
+    private func stroke(
+        _ annotation: Annotation,
+        progress: Double = 1,
+        in context: CGContext
+    ) {
+        let path = annotationCGPath(for: annotation, progress: progress) {
+            x, y in
+            CGPoint(x: bounds.width * x, y: bounds.height * y)
+        }
+        context.saveGState()
+        context.setStrokeColor(annotation.color.nsColor.cgColor)
+        context.setLineWidth(annotation.lineWidth)
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+        context.setShadow(
+            offset: .zero,
+            blur: 2,
+            color: NSColor.black.withAlphaComponent(0.7).cgColor
+        )
+        context.addPath(path)
+        context.strokePath()
+        context.restoreGState()
+    }
+}
+
 private final class RecordingSpeakerNotesPanel: NSPanel {
     override var canBecomeKey: Bool { false }
 }
@@ -442,98 +649,201 @@ private struct RecordingControlView: View {
     @ObservedObject var store: EditorStore
 
     var body: some View {
-        HStack(spacing: 12) {
-            RoundedRectangle(cornerRadius: 3)
-                .fill(
-                    store.isRecordingPaused
-                        ? Color.orange
-                        : store.isRecording ? Color.red : Color.orange
-                )
-                .frame(width: 10, height: 10)
-                .shadow(color: .red.opacity(0.5), radius: 5)
+        VStack(spacing: 8) {
+            HStack(spacing: 12) {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(
+                        store.isRecordingPaused
+                            ? Color.orange
+                            : store.isRecording ? Color.red : Color.orange
+                    )
+                    .frame(width: 10, height: 10)
+                    .shadow(color: .red.opacity(0.5), radius: 5)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(
-                    LocalizedStringKey(
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(
+                        LocalizedStringKey(
+                            store.recordingCountdownRemaining > 0
+                                ? "Start Recording"
+                                : store.isRecordingPaused ? "Paused" : "Recording…"
+                        )
+                    )
+                        .font(.system(size: 12, weight: .semibold))
+                    Text(
                         store.recordingCountdownRemaining > 0
-                            ? "Start Recording"
-                            : store.isRecordingPaused ? "Paused" : "Recording…"
+                            ? "\(store.recordingCountdownRemaining)"
+                            : store.formattedRecordingElapsed
                     )
-                )
-                    .font(.system(size: 12, weight: .semibold))
-                Text(
-                    store.recordingCountdownRemaining > 0
-                        ? "\(store.recordingCountdownRemaining)"
-                        : store.formattedRecordingElapsed
-                )
-                .font(.system(size: 12, weight: .medium, design: .monospaced))
-                .foregroundStyle(.secondary)
-            }
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                }
 
-            if store.recordMicrophone {
-                MiniAudioLevelView(monitor: store.deviceMonitor)
-                .frame(width: 76)
-            }
+                if store.recordMicrophone {
+                    MiniAudioLevelView(monitor: store.deviceMonitor)
+                    .frame(width: 76)
+                }
 
-            if RecordingCameraPreviewPresentation.shouldShow(
-                cameraSelected: store.selectedCameraID != nil,
-                hidden: store.hideCameraPreview
-            ) {
-                CameraPreviewView(session: store.deviceMonitor.cameraSession)
-                    .frame(width: 48, height: 48)
-                    .clipShape(Circle())
-                    .overlay {
-                        Circle().stroke(.white.opacity(0.55), lineWidth: 1.5)
-                    }
-            }
+                if RecordingCameraPreviewPresentation.shouldShow(
+                    cameraSelected: store.selectedCameraID != nil,
+                    hidden: store.hideCameraPreview
+                ) {
+                    CameraPreviewView(session: store.deviceMonitor.cameraSession)
+                        .frame(width: 48, height: 48)
+                        .clipShape(Circle())
+                        .overlay {
+                            Circle().stroke(.white.opacity(0.55), lineWidth: 1.5)
+                        }
+                }
 
-            Spacer(minLength: 4)
+                Spacer(minLength: 4)
 
-            Button {
-                store.recordingWindowCoordinator.showEditorWithoutStopping()
-            } label: {
-                Label("Show editor", systemImage: "rectangle.on.rectangle")
+                Button {
+                    store.recordingWindowCoordinator.showEditorWithoutStopping()
+                } label: {
+                    Label("Show editor", systemImage: "rectangle.on.rectangle")
+                        .labelStyle(.iconOnly)
+                }
+                .buttonStyle(.borderless)
+                .help("Show editor")
+
+                Button {
+                    Task { await store.toggleRecordingPause() }
+                } label: {
+                    Label(
+                        store.isRecordingPaused ? "Resume" : "Pause",
+                        systemImage: store.isRecordingPaused ? "play.fill" : "pause.fill"
+                    )
                     .labelStyle(.iconOnly)
-            }
-            .buttonStyle(.borderless)
-            .help("Show editor")
+                }
+                .buttonStyle(.borderless)
+                .help(store.isRecordingPaused ? "Resume" : "Pause")
+                .disabled(!store.isRecording || store.isTransitioningRecording)
 
-            Button {
-                Task { await store.toggleRecordingPause() }
-            } label: {
-                Label(
-                    store.isRecordingPaused ? "Resume" : "Pause",
-                    systemImage: store.isRecordingPaused ? "play.fill" : "pause.fill"
-                )
-                .labelStyle(.iconOnly)
+                Button {
+                    Task { await store.stopRecording() }
+                } label: {
+                    Label("Finish", systemImage: "stop.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .padding(.horizontal, 12)
+                        .frame(height: 34)
+                        .foregroundStyle(.white)
+                        .background(
+                            StudioTheme.recordGradient,
+                            in: RoundedRectangle(cornerRadius: 10)
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(!store.isRecording || store.isTransitioningRecording)
             }
-            .buttonStyle(.borderless)
-            .help(store.isRecordingPaused ? "Resume" : "Pause")
-            .disabled(!store.isRecording || store.isTransitioningRecording)
 
-            Button {
-                Task { await store.stopRecording() }
-            } label: {
-                Label("Finish", systemImage: "stop.fill")
-                    .font(.system(size: 12, weight: .semibold))
-                    .padding(.horizontal, 12)
-                    .frame(height: 34)
-                    .foregroundStyle(.white)
-                    .background(
-                        StudioTheme.recordGradient,
-                        in: RoundedRectangle(cornerRadius: 10)
-                    )
+            if store.isRecording, !store.isRecordingPaused {
+                Divider().opacity(0.25)
+                drawingToolbar
             }
-            .buttonStyle(.plain)
-            .disabled(!store.isRecording || store.isTransitioningRecording)
         }
         .padding(.horizontal, 16)
-        .frame(width: 470, height: 72)
+        .padding(.vertical, 10)
+        .frame(width: 640, height: 110)
         .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 18))
         .overlay {
             RoundedRectangle(cornerRadius: 18)
                 .stroke(.white.opacity(0.14), lineWidth: 1)
         }
+    }
+
+    private var drawingToolbar: some View {
+        HStack(spacing: 8) {
+            drawingToolButton(.brush, symbol: "scribble", help: "Brush")
+            drawingToolButton(.rectangle, symbol: "rectangle", help: "Rectangle")
+            drawingToolButton(.ellipse, symbol: "oval", help: "Ellipse")
+            drawingToolButton(.arrow, symbol: "arrow.right", help: "Arrow")
+            drawingToolButton(.line, symbol: "line.diagonal", help: "Line")
+
+            Spacer(minLength: 6)
+
+            ForEach(Array(AnnotationColor.palette.enumerated()), id: \.offset) {
+                index, color in
+                Button {
+                    store.recordingAnnotationColor = color
+                } label: {
+                    Circle()
+                        .fill(color.swiftUIColor)
+                        .frame(width: 16, height: 16)
+                        .overlay {
+                            Circle().stroke(
+                                store.recordingAnnotationColor == color
+                                    ? Color.white
+                                    : Color.white.opacity(0.25),
+                                lineWidth: store.recordingAnnotationColor == color
+                                    ? 2 : 1
+                            )
+                        }
+                }
+                .buttonStyle(.borderless)
+                .help("Annotation color")
+            }
+
+            ForEach(Array(recordingWidthPresets.enumerated()), id: \.offset) {
+                index, preset in
+                Button {
+                    store.recordingAnnotationLineWidth = preset.width
+                } label: {
+                    Capsule()
+                        .fill(
+                            store.recordingAnnotationLineWidth == preset.width
+                                ? Color.white
+                                : Color.white.opacity(0.55)
+                        )
+                        .frame(width: 18, height: preset.capsuleHeight)
+                }
+                .buttonStyle(.borderless)
+                .help("Line width")
+            }
+
+            Button {
+                store.undoLastRecordingAnnotation()
+            } label: {
+                Label("Undo annotation", systemImage: "arrow.uturn.backward")
+                    .labelStyle(.iconOnly)
+            }
+            .buttonStyle(.borderless)
+            .help("Undo last annotation")
+
+            Button {
+                store.clearRecordingAnnotations()
+            } label: {
+                Label("Clear annotations", systemImage: "trash")
+                    .labelStyle(.iconOnly)
+            }
+            .buttonStyle(.borderless)
+            .help("Clear annotations")
+        }
+    }
+
+    private func drawingToolButton(
+        _ kind: AnnotationKind,
+        symbol: String,
+        help: LocalizedStringKey
+    ) -> some View {
+        let armed = store.recordingDrawingTool == kind
+        return Button {
+            store.toggleRecordingDrawingTool(kind)
+        } label: {
+            Image(systemName: symbol)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(armed ? Color.black : Color.primary)
+                .frame(width: 26, height: 26)
+                .background(
+                    armed ? Color.white : Color.white.opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: 7)
+                )
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    private var recordingWidthPresets: [(width: CGFloat, capsuleHeight: CGFloat)] {
+        [(3, 2), (5, 3.5), (9, 5.5)]
     }
 }
 

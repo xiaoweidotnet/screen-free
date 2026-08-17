@@ -583,3 +583,11 @@
 "Undo" = "撤销";
 "Undo timeline edit" = "撤销时间线编辑";
 "Nothing to undo" = "没有可撤销的操作";
+"Brush" = "画笔";
+"Rectangle" = "矩形";
+"Ellipse" = "椭圆";
+"Line" = "直线";
+"Annotation color" = "标注颜色";
+"Line width" = "线宽";
+"Undo annotation" = "撤销上一笔";
+"Clear annotations" = "清空标注";

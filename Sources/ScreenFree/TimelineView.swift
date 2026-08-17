@@ -6,9 +6,6 @@ struct TimelineView: View {
     @ObservedObject var store: EditorStore
     @State private var zoomDraftStart: TimeInterval?
     @State private var zoomDraftEnd: TimeInterval?
-    @State private var annotationDraftStart: TimeInterval?
-    @State private var annotationDraftEnd: TimeInterval?
-    @State private var annotationMoveOrigins: [UUID: TimeInterval] = [:]
     @State private var splitCursorPushed = false
     @State private var magnificationStartZoom: Double?
 
@@ -50,6 +47,7 @@ struct TimelineView: View {
                     .frame(width: contentWidth, height: 39)
                 }
                 .frame(width: contentWidth)
+                .coordinateSpace(name: "timelineTracks")
                 .padding(.horizontal, 17)
                 .padding(.top, 10)
                 .background {
@@ -90,7 +88,7 @@ struct TimelineView: View {
                                 duration: duration,
                                 contentWidth: contentWidth
                             )
-                            store.seek(to: time)
+                            store.scrub(to: time)
                         }
                         .onEnded { value in
                             guard store.sourceURL != nil,
@@ -100,9 +98,7 @@ struct TimelineView: View {
                                     width: contentWidth,
                                     duration: duration,
                                     scale: scale
-                                  ),
-                                  abs(value.translation.width) < 4,
-                                  abs(value.translation.height) < 4 else {
+                                  ) else {
                                 return
                             }
                             let time = scale.time(
@@ -110,7 +106,13 @@ struct TimelineView: View {
                                 duration: duration,
                                 contentWidth: contentWidth
                             )
-                            store.seekAndPlay(to: time)
+                            if abs(value.translation.width) < 4,
+                               abs(value.translation.height) < 4 {
+                                store.endScrub(at: time)
+                                store.seekAndPlay(to: time)
+                            } else {
+                                store.endScrub(at: time)
+                            }
                         }
                 )
             }
@@ -855,6 +857,42 @@ struct TimelineView: View {
             duration: duration,
             contentWidth: width
         )
+        // The playhead owns its grab strip so dragging the line always
+        // scrubs, even when it sits exactly on an exposed clip trim handle
+        // (e.g. at the end of the timeline after playback finishes).
+        let scrubGesture = DragGesture(
+            minimumDistance: 0,
+            coordinateSpace: .named("timelineTracks")
+        )
+        .onChanged { value in
+            guard store.sourceURL != nil,
+                  store.activeTimelineTool == .selection else {
+                return
+            }
+            store.scrub(
+                to: scale.time(
+                    atX: value.location.x,
+                    duration: duration,
+                    contentWidth: width
+                )
+            )
+        }
+        .onEnded { value in
+            guard store.sourceURL != nil,
+                  store.activeTimelineTool == .selection else {
+                return
+            }
+            let time = scale.time(
+                atX: value.location.x,
+                duration: duration,
+                contentWidth: width
+            )
+            store.endScrub(at: time)
+            if abs(value.translation.width) < 4,
+               abs(value.translation.height) < 4 {
+                store.seekAndPlay(to: time)
+            }
+        }
         return ZStack(alignment: .top) {
             Rectangle()
                 .fill(StudioTheme.playhead)
@@ -865,8 +903,10 @@ struct TimelineView: View {
                 .foregroundStyle(StudioTheme.playhead)
         }
         .frame(width: 14)
+        .contentShape(Rectangle())
+        .gesture(scrubGesture)
         .offset(x: x - 7)
-        .allowsHitTesting(false)
+        .allowsHitTesting(store.activeTimelineTool == .selection)
     }
 
     private func privacyTrack(
@@ -955,132 +995,6 @@ struct TimelineView: View {
                         )
                     }
                 }
-            }
-        }
-    }
-
-    private func annotationTrack(
-        width: CGFloat,
-        duration: TimeInterval,
-        scale: TimelineScale
-    ) -> some View {
-        ZStack(alignment: .leading) {
-            RoundedRectangle(cornerRadius: 7)
-                .fill(.white.opacity(0.025))
-
-            Text("ANNOTATIONS")
-                .font(.system(size: 9, weight: .bold))
-                .foregroundStyle(.tertiary)
-                .padding(.leading, 8)
-
-            Color.clear
-                .contentShape(Rectangle())
-                .gesture(
-                    rangeCreationGesture(
-                        width: width,
-                        duration: duration,
-                        scale: scale,
-                        draftStart: $annotationDraftStart,
-                        draftEnd: $annotationDraftEnd
-                    ) { start, rangeDuration in
-                        store.addDefaultAnnotationRange(
-                            start: start,
-                            duration: rangeDuration
-                        )
-                    }
-                )
-
-            if let annotationDraftStart, let annotationDraftEnd {
-                draftRange(
-                    start: min(annotationDraftStart, annotationDraftEnd),
-                    end: max(annotationDraftStart, annotationDraftEnd),
-                    width: width,
-                    duration: duration,
-                    scale: scale,
-                    color: .orange
-                )
-            }
-
-            ForEach(store.project.annotations) { annotation in
-                let selected = annotation.id == store.selectedAnnotationID
-                let hovered =
-                    store.hoveredTimelineBlock == .annotation(annotation.id)
-                AnnotationRangeBar(
-                    annotation: annotation,
-                    selected: selected || hovered,
-                    onSelect: {
-                        store.selectedAnnotationID = annotation.id
-                        store.inspectorPanel = .annotation
-                        store.seek(to: annotation.start + 0.05)
-                    },
-                    onDelete: {
-                        store.selectedAnnotationID = annotation.id
-                        store.deleteSelectedAnnotation()
-                    }
-                )
-                .onHover { hovering in
-                    store.setHoveredTimelineBlock(
-                        .annotation(annotation.id),
-                        hovering: hovering
-                    )
-                }
-                .frame(
-                    width: max(
-                        1,
-                        scale.x(
-                            forTime: annotation.end,
-                            duration: duration,
-                            contentWidth: width
-                        ) - scale.x(
-                            forTime: annotation.start,
-                            duration: duration,
-                            contentWidth: width
-                        )
-                    ),
-                    height: 27
-                )
-                .offset(
-                    x: scale.x(
-                        forTime: annotation.start,
-                        duration: duration,
-                        contentWidth: width
-                    ),
-                    y: 6
-                )
-                .gesture(
-                    DragGesture(minimumDistance: 3)
-                        .onChanged { value in
-                            if annotationMoveOrigins[annotation.id] == nil {
-                                store.beginContinuousTimelineEdit(.annotation)
-                                annotationMoveOrigins[annotation.id] =
-                                    annotation.start
-                            }
-                            guard let origin =
-                                annotationMoveOrigins[annotation.id] else {
-                                return
-                            }
-                            let delta = scale.timeDelta(
-                                forPointDistance: value.translation.width,
-                                duration: duration,
-                                contentWidth: width
-                            )
-                            store.setAnnotationRange(
-                                id: annotation.id,
-                                start: (origin + delta).clamped(
-                                    to: 0...max(
-                                        0,
-                                        duration - annotation.duration
-                                    )
-                                ),
-                                duration: annotation.duration
-                            )
-                        }
-                        .onEnded { _ in
-                            annotationMoveOrigins[annotation.id] = nil
-                            store.endContinuousTimelineEdit()
-                        }
-                )
-                .zIndex(selected || hovered ? 2 : 1)
             }
         }
     }
@@ -1248,48 +1162,6 @@ private final class TimelinePlaybackScrollObserver: NSView {
             )
         )
         scrollView.reflectScrolledClipView(scrollView.contentView)
-    }
-}
-
-private struct AnnotationRangeBar: View {
-    let annotation: EmphasisAnnotation
-    let selected: Bool
-    let onSelect: () -> Void
-    let onDelete: () -> Void
-
-    var body: some View {
-        RoundedRectangle(cornerRadius: 6)
-            .fill(selected ? Color.orange : Color.orange.opacity(0.68))
-            .overlay {
-                HStack(spacing: 4) {
-                    Image(
-                        systemName: annotation.kind == .rectangle
-                            ? "rectangle"
-                            : "line.diagonal"
-                    )
-                    Text(
-                        annotation.kind == .rectangle
-                            ? "Rectangle"
-                            : "Line"
-                    )
-                }
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(.white)
-            }
-            .overlay {
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(
-                        selected ? Color.white : Color.white.opacity(0.18),
-                        lineWidth: selected ? 1.2 : 1
-                    )
-            }
-            .contentShape(Rectangle())
-            .onTapGesture(perform: onSelect)
-            .contextMenu {
-                Button(role: .destructive, action: onDelete) {
-                    Label("Delete annotation", systemImage: "trash")
-                }
-            }
     }
 }
 

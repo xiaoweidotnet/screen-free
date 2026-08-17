@@ -77,6 +77,41 @@ final class EditorStoreInteractionTests: XCTestCase {
         XCTAssertFalse(store.isPlaying)
     }
 
+    func testTimelineScrubPausesPlaybackAndClampsPlayhead() {
+        let store = EditorStore()
+        store.sourceURL = URL(fileURLWithPath: "/tmp/scrub-shortcut.mov")
+        store.project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 5)]
+        )
+        store.isPlaying = true
+
+        store.scrub(to: 3)
+        XCTAssertFalse(
+            store.isPlaying,
+            "Dragging the playhead must pause playback so the periodic time observer cannot fight the drag."
+        )
+        XCTAssertEqual(store.playhead, 3, accuracy: 0.0001)
+
+        store.scrub(to: -2)
+        XCTAssertEqual(store.playhead, 0, accuracy: 0.0001)
+
+        store.scrub(to: 99)
+        XCTAssertEqual(store.playhead, 5, accuracy: 0.0001)
+
+        store.endScrub(at: 2)
+        XCTAssertEqual(
+            store.playhead,
+            2,
+            accuracy: 0.0001,
+            "Releasing the drag must land exactly on the pointer's release position."
+        )
+        XCTAssertFalse(store.isPlaying)
+
+        store.endScrub()
+        XCTAssertEqual(store.playhead, 2, accuracy: 0.0001)
+        XCTAssertFalse(store.isPlaying)
+    }
+
     func testAppDelegateRoutesSpaceDirectlyToPlaybackHandler() throws {
         let appDelegate = ScreenFreeAppDelegate()
         var invocationCount = 0
@@ -540,7 +575,7 @@ final class EditorStoreInteractionTests: XCTestCase {
             focusX: 0.5,
             focusY: 0.5
         )
-        let trailingAnnotation = EmphasisAnnotation(
+        let trailingAnnotation = Annotation(
             kind: .rectangle,
             start: 5,
             duration: 0.8,
@@ -567,7 +602,10 @@ final class EditorStoreInteractionTests: XCTestCase {
 
         XCTAssertEqual(store.project.clips.map(\.id), [second.id, third.id])
         XCTAssertTrue(store.project.zooms.isEmpty)
-        XCTAssertTrue(store.project.annotations.isEmpty)
+        XCTAssertFalse(
+            store.project.annotations.isEmpty,
+            "Source-time annotations survive clip deletion like cursor samples."
+        )
         XCTAssertEqual(store.timelineUndoTitle, "Undo Delete Clip")
 
         store.undoTimelineEdit()
@@ -795,7 +833,7 @@ final class EditorStoreInteractionTests: XCTestCase {
         XCTAssertNil(store.timelineUndoTitle)
     }
 
-    func testRedactionAndAnnotationDragsCreateSeparateAtomicUndos() {
+    func testRedactionDragsCreateAtomicUndo() {
         let store = EditorStore()
         let redaction = PrivacyRedaction(
             start: 1,
@@ -803,46 +841,23 @@ final class EditorStoreInteractionTests: XCTestCase {
             normalizedX: 0.5,
             normalizedY: 0.5
         )
-        let annotation = EmphasisAnnotation(
-            kind: .rectangle,
-            start: 2,
-            duration: 2,
-            normalizedStartX: 0.2,
-            normalizedStartY: 0.2,
-            normalizedEndX: 0.8,
-            normalizedEndY: 0.8
-        )
         store.project = TimelineProject(
             clips: [TimelineClip(sourceStart: 0, duration: 10)],
-            redactions: [redaction],
-            annotations: [annotation]
+            redactions: [redaction]
         )
         store.selectedRedactionID = redaction.id
-        store.selectedAnnotationID = annotation.id
 
         store.beginContinuousTimelineEdit(.redaction)
         store.setRedactionRange(id: redaction.id, start: 3, duration: 2.5)
         store.updateSelectedRedaction(width: 0.3, opacity: 0.8)
         store.moveSelectedRedaction(x: 0.7, y: 0.3)
         store.endContinuousTimelineEdit()
-        let redactionEditedProject = store.project
 
-        store.beginContinuousTimelineEdit(.annotation)
-        store.setAnnotationRange(id: annotation.id, start: 4, duration: 1.5)
-        store.setAnnotationRange(id: annotation.id, start: 5, duration: 1)
-        store.endContinuousTimelineEdit()
-
-        XCTAssertEqual(store.timelineUndoTitle, "Undo Edit Annotation")
-
-        store.undoTimelineEdit()
-
-        XCTAssertEqual(store.project, redactionEditedProject)
         XCTAssertEqual(store.timelineUndoTitle, "Undo Edit Privacy Block")
 
         store.undoTimelineEdit()
 
         XCTAssertEqual(store.project.redactions, [redaction])
-        XCTAssertEqual(store.project.annotations, [annotation])
     }
 
     func testPrivacyModeDragCreatesBlurRegionAtChosenBounds() throws {

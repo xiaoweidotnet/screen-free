@@ -15,8 +15,6 @@ struct MainView: View {
     @AppStorage("showInspector") private var showInspector = true
     @State private var isPreviewFullscreen = false
     @State private var previewOwnsNativeFullscreen = false
-    @State private var annotationDragStart: CGPoint?
-    @State private var annotationDragEnd: CGPoint?
     @State private var privacyDragStart: CGPoint?
     @State private var privacyDragEnd: CGPoint?
 
@@ -837,37 +835,16 @@ struct MainView: View {
                                 }
 
                                 ForEach(annotations) { annotation in
-                                    EmphasisAnnotationOverlay(
+                                    AnnotationOverlay(
                                         annotation: annotation,
-                                        selected: annotation.id
-                                            == store.selectedAnnotationID
-                                    )
-                                    .frame(
-                                        width: contentSize.width,
-                                        height: contentSize.height
-                                    )
-                                    .position(
-                                        x: store.canvasPadding
-                                            + contentSize.width / 2,
-                                        y: store.canvasPadding
-                                            + contentSize.height / 2
-                                    )
-                                }
-
-                                if let annotationDragStart,
-                                   let annotationDragEnd,
-                                   case let .annotation(kind)
-                                        = store.activeTimelineTool {
-                                    EmphasisAnnotationOverlay(
-                                        annotation: EmphasisAnnotation(
-                                            kind: kind,
-                                            start: store.playhead,
-                                            normalizedStartX: annotationDragStart.x,
-                                            normalizedStartY: annotationDragStart.y,
-                                            normalizedEndX: annotationDragEnd.x,
-                                            normalizedEndY: annotationDragEnd.y
+                                        progress: annotation.drawProgress(
+                                            atSourceTime: store.project
+                                                .sourceTime(
+                                                    forTimelineTime: store
+                                                        .playhead
+                                                ) ?? annotation.start
                                         ),
-                                        selected: true
+                                        cropGeometry: cropGeometry
                                     )
                                     .frame(
                                         width: contentSize.width,
@@ -921,15 +898,6 @@ struct MainView: View {
                                             privacyDragStart = point
                                         }
                                         privacyDragEnd = point
-                                    } else if case .annotation = store.activeTimelineTool {
-                                        let point = CGPoint(
-                                            x: outputX,
-                                            y: outputY
-                                        )
-                                        if annotationDragStart == nil {
-                                            annotationDragStart = point
-                                        }
-                                        annotationDragEnd = point
                                     } else if store.inspectorPanel == .privacy,
                                        store.selectedRedactionID != nil {
                                         store.beginContinuousTimelineEdit(
@@ -966,31 +934,7 @@ struct MainView: View {
                                         privacyDragEnd = nil
                                         return
                                     }
-                                    guard case let .annotation(kind)
-                                        = store.activeTimelineTool else {
-                                        store.endContinuousTimelineEdit()
-                                        annotationDragStart = nil
-                                        annotationDragEnd = nil
-                                        return
-                                    }
-                                    guard let start = annotationDragStart,
-                                          let end = annotationDragEnd else {
-                                        annotationDragStart = nil
-                                        annotationDragEnd = nil
-                                        return
-                                    }
-                                    if hypot(
-                                        end.x - start.x,
-                                        end.y - start.y
-                                    ) >= 0.025 {
-                                        store.addAnnotation(
-                                            kind: kind,
-                                            startPoint: start,
-                                            endPoint: end
-                                        )
-                                    }
-                                    annotationDragStart = nil
-                                    annotationDragEnd = nil
+                                    store.endContinuousTimelineEdit()
                                 }
                         )
                 } else {
@@ -1507,8 +1451,6 @@ struct MainView: View {
                     TransitionInspector(store: store)
                 case .privacy:
                     PrivacyInspector(store: store)
-                case .annotation:
-                    AnnotationInspector(store: store)
                 case .export:
                     ExportInspector(store: store)
                 }
@@ -3540,63 +3482,6 @@ private struct PrivacyInspector: View {
     }
 }
 
-private struct AnnotationInspector: View {
-    @ObservedObject var store: EditorStore
-
-    private var selectedAnnotation: EmphasisAnnotation? {
-        store.project.annotations.first {
-            $0.id == store.selectedAnnotationID
-        }
-    }
-
-    var body: some View {
-        InspectorSection(title: "Emphasis annotations") {
-            Text("Choose a shape, then drag directly on the video. The annotation is included in preview and export.")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-            HStack {
-                Button {
-                    store.beginAnnotationTool(.rectangle)
-                } label: {
-                    Label("Rectangle", systemImage: "rectangle")
-                }
-                Button {
-                    store.beginAnnotationTool(.line)
-                } label: {
-                    Label("Line", systemImage: "line.diagonal")
-                }
-            }
-            .buttonStyle(ToolbarButtonStyle())
-            .disabled(store.sourceURL == nil)
-        }
-
-        if let annotation = selectedAnnotation {
-            InspectorSection(title: "Selected annotation") {
-                Text(
-                    annotation.kind == .rectangle
-                        ? "Rectangle emphasis"
-                        : "Line emphasis"
-                )
-                .font(.system(size: 12, weight: .medium))
-                Text(
-                    "\(store.formatted(annotation.start)) · \(annotation.duration, specifier: "%.1f")s"
-                )
-                .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(.secondary)
-                Button(role: .destructive) {
-                    store.deleteSelectedAnnotation()
-                } label: {
-                    Label("Delete annotation", systemImage: "trash")
-                }
-            }
-        } else {
-            Text("Draw on the preview or drag on the Annotations track.")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-        }
-    }
-}
-
 private struct ExportInspector: View {
     @ObservedObject var store: EditorStore
 
@@ -3873,44 +3758,31 @@ private struct LabeledSlider<V: BinaryFloatingPoint>: View where V.Stride: Binar
     }
 }
 
-private struct EmphasisAnnotationOverlay: View {
-    let annotation: EmphasisAnnotation
-    let selected: Bool
+private struct AnnotationOverlay: View {
+    let annotation: Annotation
+    var progress: Double = 1
+    let cropGeometry: CanvasCropGeometry
 
     var body: some View {
         Canvas { context, size in
-            let start = CGPoint(
-                x: size.width * annotation.normalizedStartX,
-                y: size.height * annotation.normalizedStartY
-            )
-            let end = CGPoint(
-                x: size.width * annotation.normalizedEndX,
-                y: size.height * annotation.normalizedEndY
-            )
-            var path = Path()
-            switch annotation.kind {
-            case .rectangle:
-                path.addRoundedRect(
-                    in: CGRect(
-                        x: min(start.x, end.x),
-                        y: min(start.y, end.y),
-                        width: abs(end.x - start.x),
-                        height: abs(end.y - start.y)
-                    ),
-                    cornerSize: CGSize(width: 10, height: 10)
+            let cgPath = annotationCGPath(
+                for: annotation,
+                progress: progress
+            ) { x, y in
+                let normalized = cropGeometry.normalizedOutputPoint(x: x, y: y)
+                return CGPoint(
+                    x: size.width * normalized.x,
+                    y: size.height * normalized.y
                 )
-            case .line:
-                path.move(to: start)
-                path.addLine(to: end)
             }
+            let path = Path(cgPath)
             context.stroke(
                 path,
-                with: .color(.orange),
+                with: .color(annotation.color.swiftUIColor),
                 style: StrokeStyle(
                     lineWidth: annotation.lineWidth,
                     lineCap: .round,
-                    lineJoin: .round,
-                    dash: selected ? [9, 5] : []
+                    lineJoin: .round
                 )
             )
         }

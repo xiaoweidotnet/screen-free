@@ -583,3 +583,11 @@
 "Undo" = "Undo";
 "Undo timeline edit" = "Undo timeline edit";
 "Nothing to undo" = "Nothing to undo";
+"Brush" = "Brush";
+"Rectangle" = "Rectangle";
+"Ellipse" = "Ellipse";
+"Line" = "Line";
+"Annotation color" = "Annotation color";
+"Line width" = "Line width";
+"Undo annotation" = "Undo annotation";
+"Clear annotations" = "Clear annotations";

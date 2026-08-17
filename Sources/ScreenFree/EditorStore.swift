@@ -54,21 +54,18 @@ final class EditorStore: ObservableObject {
         case selection
         case split
         case redaction
-        case annotation(EmphasisAnnotationKind)
     }
 
     enum TimelineContinuousEditKind: Equatable {
         case clip
         case zoom
         case redaction
-        case annotation
 
         fileprivate var actionName: String {
             switch self {
             case .clip: return "Edit Clip"
             case .zoom: return "Edit Zoom"
             case .redaction: return "Edit Privacy Block"
-            case .annotation: return "Edit Annotation"
             }
         }
     }
@@ -77,7 +74,6 @@ final class EditorStore: ObservableObject {
         case clip(UUID)
         case zoom(UUID)
         case redaction(UUID)
-        case annotation(UUID)
     }
 
     enum PlaybackBoundaryAction: Equatable {
@@ -90,7 +86,6 @@ final class EditorStore: ObservableObject {
         var selectedClipID: UUID?
         var selectedZoomID: UUID?
         var selectedRedactionID: UUID?
-        var selectedAnnotationID: UUID?
         var hoveredTimelineBlock: TimelineBlockTarget?
         var inspectorPanel: InspectorPanel
         var activeTimelineTool: TimelineEditTool
@@ -119,7 +114,6 @@ final class EditorStore: ObservableObject {
         case zoom = "Zoom"
         case transition = "Transitions"
         case privacy = "Privacy"
-        case annotation = "Annotations"
         case export = "Export"
 
         var id: Self { self }
@@ -136,7 +130,6 @@ final class EditorStore: ObservableObject {
             case .zoom: return "plus.magnifyingglass"
             case .transition: return "rectangle.2.swap"
             case .privacy: return "eye.slash"
-            case .annotation: return "pencil.and.outline"
             case .export: return "square.and.arrow.up"
             }
         }
@@ -249,6 +242,13 @@ final class EditorStore: ObservableObject {
     @Published var recordingElapsed: TimeInterval = 0
     @Published var isRecordingPaused = false
     @Published var isTransitioningRecording = false
+    @Published var recordingDrawingTool: AnnotationKind? {
+        didSet {
+            recordingWindowCoordinator.updateDrawingInteraction()
+        }
+    }
+    @Published var recordingAnnotationColor: AnnotationColor = .red
+    @Published var recordingAnnotationLineWidth: CGFloat = 5
 
     @Published var sourceURL: URL?
     @Published var cameraURL: URL?
@@ -256,7 +256,6 @@ final class EditorStore: ObservableObject {
     @Published var selectedClipID: UUID?
     @Published var selectedZoomID: UUID?
     @Published var selectedRedactionID: UUID?
-    @Published var selectedAnnotationID: UUID?
     @Published private(set) var hoveredTimelineBlock: TimelineBlockTarget?
     @Published var activeTimelineTool: TimelineEditTool = .selection
     @Published var timelineZoom = TimelineScale.fitZoom
@@ -265,6 +264,11 @@ final class EditorStore: ObservableObject {
     @Published private(set) var recordingHistory: [RecordingHistoryItem] = []
 
     @Published var playhead: TimeInterval = 0
+    private let scrubSeekInterval: TimeInterval = 1.0 / 30.0
+    private var isScrubSeekInFlight = false
+    private var pendingScrubTime: TimeInterval?
+    private var lastScrubSeekTarget: TimeInterval?
+    private var lastScrubSeekDispatchAt: UInt64?
     @Published var isPlaying = false
     @Published var isRecording = false
     @Published var isExporting = false
@@ -653,6 +657,7 @@ final class EditorStore: ObservableObject {
                 normalizedArea: selectedAreaNormalized
             )
             refreshRecordingHighlight()
+            refreshRecordingDrawing()
             if selectedCameraID != nil {
                 do {
                     try deviceMonitor.startCameraRecording()
@@ -805,6 +810,7 @@ final class EditorStore: ObservableObject {
                     normalizedArea: selectedAreaNormalized
                 )
                 refreshRecordingHighlight()
+                refreshRecordingDrawing()
                 if selectedCameraID != nil {
                     do {
                         try deviceMonitor.startCameraRecording()
@@ -1339,6 +1345,13 @@ final class EditorStore: ObservableObject {
         )
     }
 
+    func refreshRecordingDrawing() {
+        recordingWindowCoordinator.updateDrawingOverlay(
+            frame: recorder.sourceFrame,
+            visible: isPreparingRecording || isRecording
+        )
+    }
+
     func refreshSpeakerNotes() {
         guard isPreparingRecording || isRecording else { return }
         recordingWindowCoordinator.updateSpeakerNotes(
@@ -1599,24 +1612,29 @@ final class EditorStore: ObservableObject {
         let existingCursor: [CursorSample]
         let existingClicks: [MouseClick]
         let existingShortcuts: [ShortcutEvent]
+        let existingAnnotations: [Annotation]
         if preservingCapturedMetadata {
             existingCursor = project.cursorSamples
             existingClicks = project.clicks
             existingShortcuts = project.shortcuts
+            existingAnnotations = project.annotations
         } else if let embeddedInteractions {
             existingCursor = embeddedInteractions.cursorSamples
             existingClicks = embeddedInteractions.clicks
             existingShortcuts = embeddedInteractions.shortcuts
+            existingAnnotations = embeddedInteractions.annotations
         } else {
             existingCursor = []
             existingClicks = []
             existingShortcuts = []
+            existingAnnotations = []
         }
         project = TimelineProject(
             clips: [TimelineClip(sourceStart: 0, duration: duration)],
             cursorSamples: existingCursor,
             clicks: existingClicks,
-            shortcuts: existingShortcuts
+            shortcuts: existingShortcuts,
+            annotations: existingAnnotations
         )
         if preservingCapturedMetadata || embeddedInteractions?.isEmpty == false {
             // This checkpoint happens before thumbnail/audio analysis, which
@@ -1628,7 +1646,6 @@ final class EditorStore: ObservableObject {
         selectedClipID = project.clips.first?.id
         selectedZoomID = nil
         selectedRedactionID = nil
-        selectedAnnotationID = nil
         selectedTransitionID = nil
         activeTimelineTool = .selection
         playhead = 0
@@ -1808,6 +1825,93 @@ final class EditorStore: ObservableObject {
         seek(to: min(time, lastPlayableTime))
     }
 
+    /// Positions the playhead for an interactive timeline drag. Playback
+    /// pauses so the periodic time observer cannot fight the drag. The line
+    /// itself tracks the pointer on every event, while the underlying player
+    /// seeks are deduplicated, throttled, and relaxed-tolerance — the preview
+    /// frame catches up without decode churn at pointer-event rate.
+    func scrub(to time: TimeInterval) {
+        if isPlaying {
+            pausePreviewPlayback()
+        }
+        let clamped = time.clamped(to: 0...max(0, project.duration))
+        if abs(clamped - playhead) <= 0.0005,
+           lastScrubSeekTarget == clamped {
+            // The line is already there and a seek to that exact time has
+            // been dispatched — covers the two timeline drag gestures
+            // double-firing each pointer event.
+            return
+        }
+        playhead = clamped
+        pendingScrubTime = clamped
+        dispatchDueScrubSeek()
+    }
+
+    /// Finishes a drag at the pointer's release position with an exact seek
+    /// so the paused frame matches what preview rendering and export produce.
+    /// The seek bypasses the drag throttle: release always lands exactly.
+    func endScrub(at time: TimeInterval? = nil) {
+        let target = (time ?? playhead).clamped(
+            to: 0...max(0, project.duration)
+        )
+        pendingScrubTime = nil
+        lastScrubSeekDispatchAt = nil
+        lastScrubSeekTarget = target
+        seek(to: target)
+    }
+
+    private func dispatchDueScrubSeek() {
+        guard let target = pendingScrubTime, !isScrubSeekInFlight else {
+            return
+        }
+        let now = DispatchTime.now().uptimeNanoseconds
+        if let last = lastScrubSeekDispatchAt,
+           Double(now - last) / 1_000_000_000 < scrubSeekInterval {
+            return
+        }
+        pendingScrubTime = nil
+        lastScrubSeekDispatchAt = now
+        lastScrubSeekTarget = target
+        performScrubSeek(to: target)
+    }
+
+    private func performScrubSeek(to timelineTime: TimeInterval) {
+        guard let context = clipContext(atTimelineTime: timelineTime) else {
+            return
+        }
+        let localTimeline = timelineTime - context.timelineStart
+        let sourceTime = context.clip.sourceStart
+            + localTimeline * context.clip.playbackRate
+        let cmTime = CMTime(seconds: sourceTime, preferredTimescale: 600)
+        // Half a frame of tolerance lets the decoder land on a nearby frame
+        // instead of decoding from the previous keyframe on every drag tick.
+        let tolerance = CMTime(
+            seconds: 0.5 / sourceFrameRate.clamped(to: 15...120),
+            preferredTimescale: 600
+        )
+        isScrubSeekInFlight = true
+        player.volume = 1
+        player.seek(
+            to: cmTime,
+            toleranceBefore: tolerance,
+            toleranceAfter: tolerance
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.isScrubSeekInFlight = false
+                self.dispatchDueScrubSeek()
+            }
+        }
+        if cameraURL != nil {
+            cameraPlayer.seek(
+                to: cmTime,
+                toleranceBefore: tolerance,
+                toleranceAfter: tolerance
+            )
+        }
+        seekBackgroundMusic(to: timelineTime, force: false)
+    }
+
     func toggleSplitTool() {
         activeTimelineTool = activeTimelineTool == .split
             ? .selection
@@ -1900,7 +2004,6 @@ final class EditorStore: ObservableObject {
             selectedClipID: selectedClipID,
             selectedZoomID: selectedZoomID,
             selectedRedactionID: selectedRedactionID,
-            selectedAnnotationID: selectedAnnotationID,
             hoveredTimelineBlock: hoveredTimelineBlock,
             inspectorPanel: inspectorPanel,
             activeTimelineTool: activeTimelineTool,
@@ -1987,7 +2090,6 @@ final class EditorStore: ObservableObject {
         selectedClipID = snapshot.selectedClipID
         selectedZoomID = snapshot.selectedZoomID
         selectedRedactionID = snapshot.selectedRedactionID
-        selectedAnnotationID = snapshot.selectedAnnotationID
         hoveredTimelineBlock = snapshot.hoveredTimelineBlock.flatMap {
             timelineContains($0)
                 ? $0
@@ -2007,8 +2109,6 @@ final class EditorStore: ObservableObject {
             return project.zooms.contains { $0.id == id }
         case let .redaction(id):
             return project.redactions.contains { $0.id == id }
-        case let .annotation(id):
-            return project.annotations.contains { $0.id == id }
         }
     }
 
@@ -2046,9 +2146,6 @@ final class EditorStore: ObservableObject {
         case let .redaction(id):
             selectedRedactionID = id
             inspectorPanel = .privacy
-        case let .annotation(id):
-            selectedAnnotationID = id
-            inspectorPanel = .annotation
         }
     }
 
@@ -2080,8 +2177,6 @@ final class EditorStore: ObservableObject {
             return selectedZoomID.map(TimelineBlockTarget.zoom)
         case .privacy:
             return selectedRedactionID.map(TimelineBlockTarget.redaction)
-        case .annotation:
-            return selectedAnnotationID.map(TimelineBlockTarget.annotation)
         default:
             return nil
         }
@@ -2158,9 +2253,6 @@ final class EditorStore: ObservableObject {
         case .privacy:
             guard selectedRedactionID != nil else { return }
             deleteSelectedRedaction()
-        case .annotation:
-            guard selectedAnnotationID != nil else { return }
-            deleteSelectedAnnotation()
         case .clip:
             guard selectedClipID != nil else { return }
             deleteSelectedClip()
@@ -2184,10 +2276,6 @@ final class EditorStore: ObservableObject {
             selectedRedactionID = id
             inspectorPanel = .privacy
             deleteSelectedRedaction()
-        case let .annotation(id):
-            selectedAnnotationID = id
-            inspectorPanel = .annotation
-            deleteSelectedAnnotation()
         }
         hoveredTimelineBlock = nil
     }
@@ -2895,101 +2983,70 @@ final class EditorStore: ObservableObject {
             : "Privacy redaction removed."
     }
 
-    func beginAnnotationTool(_ kind: EmphasisAnnotationKind) {
-        activeTimelineTool = activeTimelineTool == .annotation(kind)
-            ? .selection
-            : .annotation(kind)
-        statusMessage = activeTimelineTool == .selection
-            ? "Annotation tool closed."
-            : "Drag on the video to draw an emphasis annotation."
-    }
-
-    func addAnnotation(
-        kind: EmphasisAnnotationKind,
-        startPoint: CGPoint,
-        endPoint: CGPoint,
-        start: TimeInterval? = nil,
-        duration requestedDuration: TimeInterval = 3
-    ) {
-        guard project.duration > 0 else { return }
-        let snapshot = captureTimelineSnapshot()
-        let safeStart = (start ?? playhead).clamped(
-            to: 0...max(0, project.duration - 0.1)
-        )
-        let safeDuration = requestedDuration.clamped(
-            to: 0.1...max(0.1, project.duration - safeStart)
-        )
-        let annotation = EmphasisAnnotation(
-            kind: kind,
-            start: safeStart,
-            duration: safeDuration,
-            normalizedStartX: startPoint.x.clamped(to: 0...1),
-            normalizedStartY: startPoint.y.clamped(to: 0...1),
-            normalizedEndX: endPoint.x.clamped(to: 0...1),
-            normalizedEndY: endPoint.y.clamped(to: 0...1)
-        )
-        project.annotations.append(annotation)
-        project.annotations.sort { $0.start < $1.start }
-        selectedAnnotationID = annotation.id
-        inspectorPanel = .annotation
-        registerTimelineEdit("Add Annotation", before: snapshot)
-        statusMessage = kind == .rectangle
-            ? "Rectangle annotation added."
-            : "Line annotation added."
-    }
-
-    func addDefaultAnnotationRange(
-        start: TimeInterval,
-        duration: TimeInterval
-    ) {
-        let kind: EmphasisAnnotationKind
-        if case let .annotation(selectedKind) = activeTimelineTool {
-            kind = selectedKind
-        } else {
-            kind = .rectangle
-        }
-        addAnnotation(
-            kind: kind,
-            startPoint: CGPoint(x: 0.3, y: 0.3),
-            endPoint: CGPoint(x: 0.7, y: 0.62),
-            start: start,
-            duration: duration
-        )
-    }
-
     func activeAnnotations(
         at time: TimeInterval? = nil
-    ) -> [EmphasisAnnotation] {
-        project.activeAnnotations(atTimelineTime: time ?? playhead)
-    }
-
-    func setAnnotationRange(
-        id: UUID,
-        start: TimeInterval,
-        duration: TimeInterval
-    ) {
-        prepareTimelineMutation(.annotation)
-        let snapshot = captureTimelineSnapshot()
-        project.setAnnotationRange(
-            id: id,
-            start: start,
-            duration: duration
-        )
-        registerTimelineMutation(.annotation, before: snapshot)
-    }
-
-    func deleteSelectedAnnotation() {
-        guard let selectedAnnotationID,
-              project.annotations.contains(
-                where: { $0.id == selectedAnnotationID }
-              ) else {
-            return
+    ) -> [Annotation] {
+        let timelineTime = time ?? playhead
+        guard let sourceTime = project.sourceTime(
+            forTimelineTime: timelineTime
+        ) else {
+            return []
         }
-        let snapshot = captureTimelineSnapshot()
-        project.annotations.removeAll { $0.id == selectedAnnotationID }
-        self.selectedAnnotationID = project.annotations.first?.id
-        registerTimelineEdit("Delete Annotation", before: snapshot)
-        statusMessage = "Annotation removed."
+        return project.activeAnnotations(atSourceTime: sourceTime)
+    }
+
+    // MARK: Recording-time drawing
+
+    func toggleRecordingDrawingTool(_ kind: AnnotationKind) {
+        recordingDrawingTool = recordingDrawingTool == kind ? nil : kind
+    }
+
+    /// Reads the global Quartz mouse position and normalizes it against the
+    /// recorded source frame, matching `captureCursorSample` (Y flipped to
+    /// bottom-up video-composition coordinates).
+    func normalizedDrawingPoint() -> NormalizedPoint? {
+        let frame = recorder.sourceFrame
+        guard frame.width > 0, frame.height > 0,
+              let point = CGEvent(source: nil)?.location else {
+            return nil
+        }
+        let x = ((point.x - frame.minX) / frame.width).clamped(to: 0...1)
+        let topDownY = ((point.y - frame.minY) / frame.height).clamped(to: 0...1)
+        return NormalizedPoint(x: x, y: 1 - topDownY)
+    }
+
+    func commitRecordingAnnotation(
+        kind: AnnotationKind,
+        points: [NormalizedPoint],
+        start: NormalizedPoint,
+        end: NormalizedPoint,
+        strokeBeganAt: TimeInterval,
+        strokeEndedAt: TimeInterval
+    ) {
+        guard isRecording, !isRecordingPaused else { return }
+        let annotation = Annotation(
+            kind: kind,
+            start: strokeBeganAt,
+            duration: 3,
+            drawDuration: max(0, strokeEndedAt - strokeBeganAt),
+            points: kind == .brush ? points : [],
+            normalizedStartX: start.x,
+            normalizedStartY: start.y,
+            normalizedEndX: end.x,
+            normalizedEndY: end.y,
+            lineWidth: recordingAnnotationLineWidth,
+            color: recordingAnnotationColor
+        )
+        project.annotations.append(annotation)
+    }
+
+    func undoLastRecordingAnnotation() {
+        guard !project.annotations.isEmpty else { return }
+        project.annotations.removeLast()
+    }
+
+    func clearRecordingAnnotations() {
+        project.annotations.removeAll()
     }
 
     private func clampSelectedRedactionCenter() {
@@ -4015,7 +4072,6 @@ final class EditorStore: ObservableObject {
         selectedClipID = project.clips.first?.id
         selectedZoomID = project.zooms.first?.id
         selectedRedactionID = project.redactions.first?.id
-        selectedAnnotationID = project.annotations.first?.id
         canvasAspectRatio = snapshot.canvasAspectRatio ?? .source
         canvasContentMode = snapshot.canvasContentMode ?? .fit
         canvasPadding = snapshot.canvasPadding
@@ -4198,7 +4254,7 @@ final class EditorStore: ObservableObject {
         )
     }
 
-    private var currentRecordingElapsed: TimeInterval {
+    var currentRecordingElapsed: TimeInterval {
         guard !isRecordingPaused, let recordingStartUptime else {
             return recordingAccumulatedDuration
         }

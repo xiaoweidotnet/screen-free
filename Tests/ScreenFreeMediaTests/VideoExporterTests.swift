@@ -953,6 +953,280 @@ final class VideoExporterTests: XCTestCase {
         )
     }
 
+    func testRecordingAnnotationRendersIntoCurrentFrameAndMP4() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sourceURL = directory.appendingPathComponent("source.mp4")
+        let outputURL = directory.appendingPathComponent("annotated.mp4")
+        try await makeSyntheticMedia(
+            at: sourceURL,
+            highFrequencyPattern: true
+        )
+        let annotation = Annotation(
+            kind: .line,
+            start: 0.15,
+            duration: 0.5,
+            normalizedStartX: 0.3,
+            normalizedStartY: 0.3,
+            normalizedEndX: 0.7,
+            normalizedEndY: 0.7,
+            lineWidth: 6,
+            color: .red
+        )
+        let project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 1)],
+            annotations: [annotation]
+        )
+        let exporter = VideoExporter()
+        let activeFrame = try await exporter.renderFrame(
+            sourceURL: sourceURL,
+            project: project,
+            timelineTime: 0.4,
+            canvasStyle: .plain,
+            frameRate: 15
+        )
+        let plainFrame = try await exporter.renderFrame(
+            sourceURL: sourceURL,
+            project: TimelineProject(
+                clips: [TimelineClip(sourceStart: 0, duration: 1)]
+            ),
+            timelineTime: 0.4,
+            canvasStyle: .plain,
+            frameRate: 15
+        )
+        let activeCenter = pixel(
+            in: rgbaPixels(from: activeFrame),
+            width: activeFrame.width,
+            x: activeFrame.width / 2,
+            y: activeFrame.height / 2
+        )
+        let plainCenter = pixel(
+            in: rgbaPixels(from: plainFrame),
+            width: plainFrame.width,
+            x: plainFrame.width / 2,
+            y: plainFrame.height / 2
+        )
+        XCTAssertGreaterThan(
+            Int(activeCenter.red),
+            Int(plainCenter.red) + 40,
+            "A red annotation stroke must render across the center of the current-frame output."
+        )
+
+        try await exporter.export(
+            sourceURL: sourceURL,
+            project: project,
+            canvasStyle: .plain,
+            destinationURL: outputURL,
+            frameRate: 15
+        )
+        let generator = AVAssetImageGenerator(
+            asset: AVURLAsset(url: outputURL)
+        )
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        let activeMP4Frame = try await generator.image(
+            at: CMTime(seconds: 0.4, preferredTimescale: 600)
+        ).image
+        let inactiveMP4Frame = try await generator.image(
+            at: CMTime(seconds: 0.9, preferredTimescale: 600)
+        ).image
+        let activeMP4Center = pixel(
+            in: rgbaPixels(from: activeMP4Frame),
+            width: activeMP4Frame.width,
+            x: activeMP4Frame.width / 2,
+            y: activeMP4Frame.height / 2
+        )
+        let inactiveMP4Center = pixel(
+            in: rgbaPixels(from: inactiveMP4Frame),
+            width: inactiveMP4Frame.width,
+            x: inactiveMP4Frame.width / 2,
+            y: inactiveMP4Frame.height / 2
+        )
+        XCTAssertGreaterThan(
+            Int(activeMP4Center.red),
+            Int(inactiveMP4Center.red) + 40,
+            "The annotation must be baked into the exported MP4 during its fade window."
+        )
+    }
+
+    func testAnnotationPartialProgressReplaysTheDrawingGesture() {
+        let transform: (CGFloat, CGFloat) -> CGPoint = { x, y in
+            CGPoint(x: 1000 * x, y: 1000 * y)
+        }
+        let box = Annotation(
+            kind: .rectangle,
+            start: 0,
+            normalizedStartX: 0.2,
+            normalizedStartY: 0.2,
+            normalizedEndX: 0.8,
+            normalizedEndY: 0.8
+        )
+        let fullBox = annotationCGPath(for: box, transform: transform)
+        let halfBox = annotationCGPath(
+            for: box,
+            progress: 0.5,
+            transform: transform
+        )
+        XCTAssertEqual(fullBox.boundingBox.width, 600, accuracy: 1)
+        XCTAssertEqual(halfBox.boundingBox.width, 300, accuracy: 1)
+
+        let brush = Annotation(
+            kind: .brush,
+            start: 0,
+            points: [
+                NormalizedPoint(x: 0.1, y: 0.1),
+                NormalizedPoint(x: 0.5, y: 0.1),
+                NormalizedPoint(x: 0.9, y: 0.1)
+            ]
+        )
+        let fullStroke = annotationCGPath(for: brush, transform: transform)
+        let midStroke = annotationCGPath(
+            for: brush,
+            progress: 0.5,
+            transform: transform
+        )
+        XCTAssertEqual(fullStroke.boundingBox.width, 800, accuracy: 1)
+        XCTAssertEqual(midStroke.boundingBox.width, 400, accuracy: 1)
+
+        let arrow = Annotation(
+            kind: .arrow,
+            start: 0,
+            normalizedStartX: 0.2,
+            normalizedStartY: 0.2,
+            normalizedEndX: 0.8,
+            normalizedEndY: 0.2
+        )
+        let partialArrow = annotationCGPath(
+            for: arrow,
+            progress: 0.5,
+            transform: transform
+        )
+        XCTAssertEqual(
+            partialArrow.boundingBox.maxX,
+            500,
+            accuracy: 1,
+            "A half-drawn arrow must stop at the interpolated tip position."
+        )
+    }
+
+    func testRecordingAnnotationReplaysDrawingProgressInFrameAndMP4()
+        async throws
+    {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sourceURL = directory.appendingPathComponent("source.mp4")
+        let outputURL = directory.appendingPathComponent("replay.mp4")
+        try await makeSyntheticMedia(
+            at: sourceURL,
+            highFrequencyPattern: true
+        )
+        // Drawn from 0.1 s to 0.5 s, then held for 0.4 s (gone by 0.9 s).
+        let annotation = Annotation(
+            kind: .rectangle,
+            start: 0.1,
+            duration: 0.4,
+            drawDuration: 0.4,
+            normalizedStartX: 0.25,
+            normalizedStartY: 0.25,
+            normalizedEndX: 0.75,
+            normalizedEndY: 0.75,
+            lineWidth: 8,
+            color: .red
+        )
+        let project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 1)],
+            annotations: [annotation]
+        )
+        let exporter = VideoExporter()
+        let midDrawFrame = try await exporter.renderFrame(
+            sourceURL: sourceURL,
+            project: project,
+            timelineTime: 0.3,
+            canvasStyle: .plain,
+            frameRate: 15
+        )
+        let completedFrame = try await exporter.renderFrame(
+            sourceURL: sourceURL,
+            project: project,
+            timelineTime: 0.7,
+            canvasStyle: .plain,
+            frameRate: 15
+        )
+        let beforeFrame = try await exporter.renderFrame(
+            sourceURL: sourceURL,
+            project: project,
+            timelineTime: 0.05,
+            canvasStyle: .plain,
+            frameRate: 15
+        )
+        let midDrawRed = redPixelCount(in: midDrawFrame)
+        let completedRed = redPixelCount(in: completedFrame)
+        let beforeRed = redPixelCount(in: beforeFrame)
+        XCTAssertGreaterThan(
+            completedRed,
+            midDrawRed + 40,
+            "Halfway through the drawing gesture the box must cover fewer pixels than the finished shape."
+        )
+        XCTAssertGreaterThan(
+            midDrawRed,
+            beforeRed + 40,
+            "The stroke must already be partially visible mid-draw."
+        )
+
+        try await exporter.export(
+            sourceURL: sourceURL,
+            project: project,
+            canvasStyle: .plain,
+            destinationURL: outputURL,
+            frameRate: 15
+        )
+        let generator = AVAssetImageGenerator(
+            asset: AVURLAsset(url: outputURL)
+        )
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        let exportedFrame: (Double) async throws -> CGImage = { seconds in
+            try await generator.image(
+                at: CMTime(seconds: seconds, preferredTimescale: 600)
+            ).image
+        }
+        let midMP4 = redPixelCount(
+            in: try await exportedFrame(0.3)
+        )
+        let completedMP4 = redPixelCount(
+            in: try await exportedFrame(0.7)
+        )
+        XCTAssertGreaterThan(
+            completedMP4,
+            midMP4 + 40,
+            "The exported MP4 must replay the drawing gesture, not jump to the finished shape."
+        )
+    }
+
+    private func redPixelCount(in image: CGImage) -> Int {
+        let pixels = rgbaPixels(from: image)
+        var count = 0
+        for offset in stride(from: 0, to: pixels.count, by: 4)
+        where pixels[offset] > 140
+            && pixels[offset + 1] < 110
+            && pixels[offset + 2] < 110 {
+            count += 1
+        }
+        return count
+    }
+
     func testLegacyProjectWithoutCanvasCropFieldsStillLoads() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -1564,6 +1838,53 @@ final class VideoExporterTests: XCTestCase {
         XCTAssertTrue(
             store.project.cursorSamples.isEmpty,
             "A fresh import or sidecar-less history item must not inherit another video's cursor path."
+        )
+    }
+
+    @MainActor
+    func testRecordingFinalizationKeepsDrawnAnnotationsInTimelineProject()
+        async throws
+    {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sourceURL = directory.appendingPathComponent("source.mp4")
+        try await makeSyntheticMedia(at: sourceURL)
+        let drawnBox = Annotation(
+            kind: .rectangle,
+            start: 0.2,
+            normalizedStartX: 0.3,
+            normalizedStartY: 0.3,
+            normalizedEndX: 0.7,
+            normalizedEndY: 0.7,
+            color: .red
+        )
+        let store = EditorStore()
+        store.project = TimelineProject(annotations: [drawnBox])
+
+        try await store.loadVideo(
+            sourceURL,
+            preservingCapturedMetadata: true
+        )
+
+        XCTAssertEqual(
+            store.project.annotations,
+            [drawnBox],
+            "Stopping a recording must carry drawn annotations into the editor project."
+        )
+        XCTAssertEqual(
+            store.activeAnnotations(at: 1.0),
+            [drawnBox],
+            "The editor preview must still see the annotation inside its fade window."
+        )
+        XCTAssertTrue(
+            store.activeAnnotations(at: 3.5).isEmpty,
+            "Annotations are visible only inside their fade window."
         )
     }
 
