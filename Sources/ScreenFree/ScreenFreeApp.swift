@@ -139,6 +139,12 @@ struct ScreenFreeApp: App {
 
     var body: some Scene {
         WindowGroup {
+            // PROTOTYPE — throwaway home/setup/teleprompter prototype, launched via
+            // `swift run ScreenFree --prototype-home`. Remove with the Prototype/
+            // directory once the variant decision is made.
+            if CommandLine.arguments.contains("--prototype-home") {
+                PrototypeFlowRoot()
+            } else {
             MainView(store: store)
                 .frame(minWidth: 1120, minHeight: 720)
                 .environment(\.locale, store.appLanguage.locale)
@@ -165,6 +171,7 @@ struct ScreenFreeApp: App {
                 ) { _ in
                     store.applicationWillTerminate()
                 }
+            }
         }
         .commands {
             CommandGroup(replacing: .newItem) {
