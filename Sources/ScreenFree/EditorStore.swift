@@ -104,7 +104,6 @@ final class EditorStore: ObservableObject {
     }
 
     enum InspectorPanel: String, CaseIterable, Identifiable {
-        case recording = "Recording"
         case canvas = "Canvas"
         case cursor = "Cursor"
         case audio = "Audio"
@@ -120,7 +119,6 @@ final class EditorStore: ObservableObject {
 
         var symbol: String {
             switch self {
-            case .recording: return "record.circle"
             case .canvas: return "rectangle.inset.filled"
             case .cursor: return "cursorarrow.motionlines"
             case .audio: return "waveform"
@@ -135,7 +133,15 @@ final class EditorStore: ObservableObject {
         }
     }
 
-    @Published var inspectorPanel: InspectorPanel = .recording
+    enum AppScreen: Equatable {
+        case home
+        case recordingSetup
+        case editor
+    }
+
+    @Published var inspectorPanel: InspectorPanel = .canvas
+    @Published var appScreen: AppScreen = .home
+    private var screenBeforeSetup: AppScreen = .home
     @Published var captureMode: CaptureMode = .display
     @Published var captureTargets: [CaptureTarget] = []
     @Published var captureThumbnails: [UInt32: NSImage] = [:]
@@ -219,19 +225,43 @@ final class EditorStore: ObservableObject {
             )
         }
     }
-    @Published var showSpeakerNotes: Bool {
+    /// 本次录制实际使用的口播稿；开录瞬间捕获，随项目快照落盘。
+    /// 编辑器当前会话的 `scriptText` 在录制中不可编辑（提词器只读），
+    /// 单独持有可避免录制后到下次开录之间的任何改动污染项目。
+    private(set) var recordingScriptText: String?
+    @Published var scriptText = ""
+    @Published var recentScripts: [RecentScriptEntry] = []
+    @Published var prompterFontSize: Double {
         didSet {
             UserDefaults.standard.set(
-                showSpeakerNotes,
-                forKey: "showSpeakerNotes"
+                prompterFontSize,
+                forKey: "teleprompterFontSize"
             )
         }
     }
-    @Published var speakerNotesText: String {
+    @Published var prompterSpeed: Double {
         didSet {
             UserDefaults.standard.set(
-                speakerNotesText,
-                forKey: "speakerNotesText"
+                prompterSpeed,
+                forKey: "teleprompterSpeed"
+            )
+        }
+    }
+    /// 手动接管（⌥空格 / 面板按钮 / 拖动面板）后为 true，自动滚动暂停。
+    @Published var prompterPaused = false
+    @Published var teleprompterPanelSize: CGSize {
+        didSet {
+            let clamped = RecordingTeleprompterPresentation.clamped(
+                size: teleprompterPanelSize
+            )
+            teleprompterPanelSize = clamped
+            UserDefaults.standard.set(
+                Double(clamped.width),
+                forKey: "teleprompterPanelWidth"
+            )
+            UserDefaults.standard.set(
+                Double(clamped.height),
+                forKey: "teleprompterPanelHeight"
             )
         }
     }
@@ -255,6 +285,9 @@ final class EditorStore: ObservableObject {
     @Published var project = TimelineProject()
     @Published var selectedClipID: UUID?
     @Published var selectedZoomID: UUID?
+    /// Multi-selection for zoom blocks (marquee, ⌘-click, Select All). When
+    /// it holds more than one id, Delete removes the whole set at once.
+    @Published var selectedZoomIDs: Set<UUID> = []
     @Published var selectedRedactionID: UUID?
     @Published private(set) var hoveredTimelineBlock: TimelineBlockTarget?
     @Published var activeTimelineTool: TimelineEditTool = .selection
@@ -264,11 +297,16 @@ final class EditorStore: ObservableObject {
     @Published private(set) var recordingHistory: [RecordingHistoryItem] = []
 
     @Published var playhead: TimeInterval = 0
-    private let scrubSeekInterval: TimeInterval = 1.0 / 30.0
+    private let scrubSeekInterval: TimeInterval = 1.0 / 60.0
     private var isScrubSeekInFlight = false
     private var pendingScrubTime: TimeInterval?
     private var lastScrubSeekTarget: TimeInterval?
     private var lastScrubSeekDispatchAt: UInt64?
+    /// True while an interactive drag owns the playhead. The periodic time
+    /// observer must not write the playhead while this is set, and playback
+    /// resumes on release when the drag interrupted an active playback.
+    private(set) var isScrubbing = false
+    private var wasPlayingBeforeScrub = false
     @Published var isPlaying = false
     @Published var isRecording = false
     @Published var isExporting = false
@@ -444,12 +482,26 @@ final class EditorStore: ObservableObject {
                 forKey: "afterRecordingAction"
             ) ?? ""
         ) ?? .edit
-        showSpeakerNotes = UserDefaults.standard.object(
-            forKey: "showSpeakerNotes"
-        ) as? Bool ?? false
-        speakerNotesText = UserDefaults.standard.string(
-            forKey: "speakerNotesText"
-        ) ?? ""
+        SpeakerNotesMigration.run()
+        recentScripts = RecentScriptsStore().load()
+        prompterFontSize = UserDefaults.standard.object(
+            forKey: "teleprompterFontSize"
+        ) as? Double ?? 22
+        prompterSpeed = UserDefaults.standard.object(
+            forKey: "teleprompterSpeed"
+        ) as? Double ?? 1
+        teleprompterPanelSize = RecordingTeleprompterPresentation.clamped(
+            size: CGSize(
+                width: UserDefaults.standard.object(
+                    forKey: "teleprompterPanelWidth"
+                ) as? Double
+                    ?? RecordingTeleprompterPresentation.defaultPanelSize.width,
+                height: UserDefaults.standard.object(
+                    forKey: "teleprompterPanelHeight"
+                ) as? Double
+                    ?? RecordingTeleprompterPresentation.defaultPanelSize.height
+            )
+        )
         pruneClipboardExports()
         installAutosave()
     }
@@ -677,6 +729,10 @@ final class EditorStore: ObservableObject {
             canvasContentMode = .fit
             playhead = 0
             beginMouseCapture()
+            recordingScriptText = Self.normalizedScript(scriptText)
+            prompterPaused = false
+            persistLastRecordingSetup()
+            recordRecentScriptIfNeeded()
             statusMessage = "Recording… click Stop when you are finished."
         } catch {
             isPreparingRecording = false
@@ -735,6 +791,7 @@ final class EditorStore: ObservableObject {
             isRecording = false
             isRecordingPaused = false
             recordingWindowCoordinator.dismissAndRestoreEditor()
+            appScreen = .editor
             switch afterRecordingAction {
             case .edit:
                 statusMessage = "Recording saved. Preparing the timeline…"
@@ -1033,6 +1090,7 @@ final class EditorStore: ObservableObject {
         Task {
             do {
                 try await loadVideo(url)
+                appScreen = .editor
                 statusMessage = "Imported \(url.lastPathComponent)"
             } catch {
                 errorMessage = error.localizedDescription
@@ -1109,6 +1167,7 @@ final class EditorStore: ObservableObject {
                 try await loadVideo(item.url)
             }
             inspectorPanel = .clip
+            appScreen = .editor
             statusMessage = "Recording opened for editing."
         } catch {
             errorMessage = error.localizedDescription
@@ -1352,10 +1411,73 @@ final class EditorStore: ObservableObject {
         )
     }
 
-    func refreshSpeakerNotes() {
-        guard isPreparingRecording || isRecording else { return }
-        recordingWindowCoordinator.updateSpeakerNotes(
-            onDisplayID: selectedTargetID
+    var scriptHasText: Bool {
+        !scriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    func resetTeleprompterPosition() {
+        recordingWindowCoordinator.resetTeleprompterPosition()
+    }
+
+    /// 录制设置页入口：从首页或编辑器工具栏进入，开录前完成全部配置。
+    /// 每次进入都按"上一次真正使用的配置"还原默认值；口播稿除外——
+    /// 新录制默认空稿，复用走最近稿子列表（见 ADR 0002）。
+    func presentRecordingSetup() {
+        guard !isRecording, !isPreparingRecording else { return }
+        applyLastRecordingSetup()
+        if appScreen != .recordingSetup {
+            screenBeforeSetup = appScreen
+        }
+        appScreen = .recordingSetup
+    }
+
+    func dismissRecordingSetup() {
+        guard appScreen == .recordingSetup else { return }
+        appScreen = screenBeforeSetup
+    }
+
+    private func applyLastRecordingSetup() {
+        guard let setup = LastRecordingSetupStore().load() else { return }
+        captureMode = setup.captureMode
+        selectedTargetID = setup.selectedTargetID
+        selectedAreaNormalized = setup.selectedAreaNormalized
+        systemAudioMode = setup.systemAudioMode
+        selectedAudioApplicationIDs = setup.selectedAudioApplicationIDs
+        recordMicrophone = setup.recordMicrophone
+        if let microphoneID = setup.selectedMicrophoneID {
+            selectedMicrophoneID = microphoneID
+        }
+        selectedCameraID = setup.selectedCameraID
+        countdownSeconds = setup.countdownSeconds
+        highlightRecordingArea = setup.highlightRecordingArea
+    }
+
+    private func persistLastRecordingSetup() {
+        LastRecordingSetupStore().save(
+            LastRecordingSetup(
+                captureMode: captureMode,
+                selectedTargetID: selectedTargetID,
+                selectedAreaNormalized: selectedAreaNormalized,
+                systemAudioMode: systemAudioMode,
+                selectedAudioApplicationIDs: selectedAudioApplicationIDs,
+                recordMicrophone: recordMicrophone,
+                selectedMicrophoneID: selectedMicrophoneID,
+                selectedCameraID: selectedCameraID,
+                countdownSeconds: countdownSeconds,
+                highlightRecordingArea: highlightRecordingArea
+            )
+        )
+    }
+
+    private func recordRecentScriptIfNeeded() {
+        guard
+            !scriptText.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).isEmpty
+        else { return }
+        recentScripts = RecentScriptsStore().record(
+            title: RecentScriptsStore.title(for: scriptText),
+            text: scriptText
         )
     }
 
@@ -1371,6 +1493,7 @@ final class EditorStore: ObservableObject {
             do {
                 let snapshot = try persistence.load(from: url)
                 try await restore(snapshot)
+                appScreen = .editor
                 statusMessage = "Opened \(url.lastPathComponent)"
             } catch {
                 errorMessage = error.localizedDescription
@@ -1388,9 +1511,11 @@ final class EditorStore: ObservableObject {
         do {
             if url.pathExtension.lowercased() == "screenfree" {
                 try await restore(persistence.load(from: url))
+                appScreen = .editor
                 statusMessage = "Opened \(url.lastPathComponent)"
             } else {
                 try await loadVideo(url)
+                appScreen = .editor
                 inspectorPanel = .clip
                 statusMessage = "Imported \(url.lastPathComponent)"
             }
@@ -1767,6 +1892,12 @@ final class EditorStore: ObservableObject {
         return true
     }
 
+    /// Relative jump (e.g. ⇧← / ⇧→ = ±1 s) that keeps the play/pause state.
+    func skip(by seconds: TimeInterval) {
+        guard sourceURL != nil, project.duration > 0 else { return }
+        seek(to: playhead + seconds)
+    }
+
     func stepFrame(_ direction: Int) {
         player.pause()
         cameraPlayer.pause()
@@ -1826,11 +1957,16 @@ final class EditorStore: ObservableObject {
     }
 
     /// Positions the playhead for an interactive timeline drag. Playback
-    /// pauses so the periodic time observer cannot fight the drag. The line
+    /// pauses so the periodic time observer cannot fight the drag, and it
+    /// resumes on release when the drag interrupted playback. The line
     /// itself tracks the pointer on every event, while the underlying player
     /// seeks are deduplicated, throttled, and relaxed-tolerance — the preview
     /// frame catches up without decode churn at pointer-event rate.
     func scrub(to time: TimeInterval) {
+        if !isScrubbing {
+            isScrubbing = true
+            wasPlayingBeforeScrub = isPlaying
+        }
         if isPlaying {
             pausePreviewPlayback()
         }
@@ -1850,6 +1986,8 @@ final class EditorStore: ObservableObject {
     /// Finishes a drag at the pointer's release position with an exact seek
     /// so the paused frame matches what preview rendering and export produce.
     /// The seek bypasses the drag throttle: release always lands exactly.
+    /// A drag that interrupted playback resumes playing from the release
+    /// position, so scrubbing mid-playback never strands the user paused.
     func endScrub(at time: TimeInterval? = nil) {
         let target = (time ?? playhead).clamped(
             to: 0...max(0, project.duration)
@@ -1857,7 +1995,14 @@ final class EditorStore: ObservableObject {
         pendingScrubTime = nil
         lastScrubSeekDispatchAt = nil
         lastScrubSeekTarget = target
-        seek(to: target)
+        let shouldResume = isScrubbing && wasPlayingBeforeScrub
+        isScrubbing = false
+        wasPlayingBeforeScrub = false
+        if shouldResume {
+            seekAndPlay(to: target)
+        } else {
+            seek(to: target)
+        }
     }
 
     private func dispatchDueScrubSeek() {
@@ -1929,6 +2074,10 @@ final class EditorStore: ObservableObject {
 
     @discardableResult
     func handleEscape() -> Bool {
+        if selectedZoomIDs.count > 1 {
+            clearZoomMultiSelection()
+            return true
+        }
         guard activeTimelineTool != .selection else { return false }
         cancelTimelineTool()
         return true
@@ -2090,6 +2239,10 @@ final class EditorStore: ObservableObject {
         selectedClipID = snapshot.selectedClipID
         selectedZoomID = snapshot.selectedZoomID
         selectedRedactionID = snapshot.selectedRedactionID
+        // Undo/redo can remove or restore zooms; keep the multi-selection
+        // limited to blocks that actually exist afterwards.
+        let zoomIDs = Set(snapshot.project.zooms.map(\.id))
+        selectedZoomIDs = selectedZoomIDs.intersection(zoomIDs)
         hoveredTimelineBlock = snapshot.hoveredTimelineBlock.flatMap {
             timelineContains($0)
                 ? $0
@@ -2142,6 +2295,10 @@ final class EditorStore: ObservableObject {
             inspectorPanel = .clip
         case let .zoom(id):
             selectedZoomID = id
+            // Hovering must not destroy an explicit multi-selection.
+            if selectedZoomIDs.count <= 1 {
+                selectedZoomIDs = [id]
+            }
             inspectorPanel = .zoom
         case let .redaction(id):
             selectedRedactionID = id
@@ -2268,9 +2425,8 @@ final class EditorStore: ObservableObject {
         case let .clip(id):
             _ = deleteClip(id: id, historySnapshot: snapshot)
         case let .zoom(id):
-            selectedZoomID = id
             inspectorPanel = .zoom
-            deleteSelectedZoom()
+            deleteZoom(id: id)
             statusMessage = "Zoom removed."
         case let .redaction(id):
             selectedRedactionID = id
@@ -2774,14 +2930,99 @@ final class EditorStore: ObservableObject {
     }
 
     func deleteSelectedZoom() {
-        guard let selectedZoomID,
-              project.zooms.contains(where: { $0.id == selectedZoomID }) else {
+        deleteSelectedZooms()
+    }
+
+    /// Removes every zoom in the multi-selection (falling back to the single
+    /// selection) as one undoable edit.
+    func deleteSelectedZooms() {
+        var ids = selectedZoomIDs
+        if let selectedZoomID {
+            ids.insert(selectedZoomID)
+        }
+        let removedCount = project.zooms.filter { ids.contains($0.id) }.count
+        guard removedCount > 0 else { return }
+        let snapshot = captureTimelineSnapshot()
+        project.zooms.removeAll { ids.contains($0.id) }
+        selectedZoomIDs = []
+        selectedZoomID = project.zooms.first?.id
+        registerTimelineEdit(
+            removedCount > 1 ? "Delete Zooms" : "Delete Zoom",
+            before: snapshot
+        )
+    }
+
+    /// Collapses the zoom selection to a single block (plain click).
+    func selectZoom(_ id: UUID) {
+        selectedZoomID = id
+        selectedZoomIDs = [id]
+        inspectorPanel = .zoom
+    }
+
+    /// Deletes one specific zoom. When the block belongs to a larger
+    /// multi-selection, the whole selection is removed instead.
+    func deleteZoom(id: UUID) {
+        if selectedZoomIDs.count > 1, selectedZoomIDs.contains(id) {
+            deleteSelectedZooms()
             return
         }
-        let snapshot = captureTimelineSnapshot()
-        project.zooms.removeAll { $0.id == selectedZoomID }
-        self.selectedZoomID = project.zooms.first?.id
-        registerTimelineEdit("Delete Zoom", before: snapshot)
+        selectedZoomIDs = [id]
+        selectedZoomID = id
+        deleteSelectedZooms()
+    }
+
+    /// ⌘-click: adds or removes one zoom from the multi-selection.
+    func toggleZoomSelection(_ id: UUID) {
+        guard project.zooms.contains(where: { $0.id == id }) else { return }
+        if selectedZoomIDs.isEmpty, let selectedZoomID {
+            selectedZoomIDs = [selectedZoomID]
+        }
+        if selectedZoomIDs.contains(id) {
+            selectedZoomIDs.remove(id)
+        } else {
+            selectedZoomIDs.insert(id)
+        }
+        selectedZoomID = selectedZoomIDs.contains(id)
+            ? id
+            : selectedZoomIDs.first
+        if !selectedZoomIDs.isEmpty {
+            inspectorPanel = .zoom
+        }
+    }
+
+    /// Selects every zoom block on the timeline (⌘A).
+    @discardableResult
+    func selectAllZooms() -> Bool {
+        guard !project.zooms.isEmpty else { return false }
+        selectedZoomIDs = Set(project.zooms.map(\.id))
+        selectedZoomID = project.zooms.first?.id
+        inspectorPanel = .zoom
+        statusMessage = "All zooms selected — press Delete to remove them."
+        return true
+    }
+
+    /// Marquee selection: selects every zoom overlapping the dragged time
+    /// range. Holding ⇧ keeps blocks that were already selected.
+    func selectZooms(
+        intersecting range: ClosedRange<TimeInterval>,
+        extendingSelection: Bool = false
+    ) {
+        let hits = project.zooms
+            .filter { $0.end > range.lowerBound && $0.start < range.upperBound }
+            .map(\.id)
+        var ids = extendingSelection ? selectedZoomIDs : []
+        ids.formUnion(hits)
+        selectedZoomIDs = ids
+        selectedZoomID = hits.first ?? ids.first
+        if !ids.isEmpty {
+            inspectorPanel = .zoom
+        }
+    }
+
+    /// Clears any zoom multi-selection without touching the single selection.
+    func clearZoomMultiSelection() {
+        guard !selectedZoomIDs.isEmpty else { return }
+        selectedZoomIDs = []
     }
 
     func addRedactionAtPlayhead() {
@@ -3491,7 +3732,8 @@ final class EditorStore: ObservableObject {
             microphoneVolume: microphoneAudioVolume,
             microphoneMuted: microphoneAudioMuted,
             trackPeaks: audioAnalysis.trackPeaks,
-            trackPeakEnvelopes: audioAnalysis.trackPeakEnvelopes
+            trackPeakEnvelopes: audioAnalysis.trackPeakEnvelopes,
+            trackLoudness: audioAnalysis.trackLoudness
         )
     }
 
@@ -3637,8 +3879,10 @@ final class EditorStore: ObservableObject {
 
     private func installPlayerObserver() {
         guard timeObserver == nil else { return }
+        // 60 Hz: the playhead line and the playhead-driven zoom/pan preview
+        // animate at display rate instead of a visibly stepped 30 Hz.
         timeObserver = player.addPeriodicTimeObserver(
-            forInterval: CMTime(value: 1, timescale: 30),
+            forInterval: CMTime(value: 1, timescale: 60),
             queue: .main
         ) { [weak self] time in
             guard let self else { return }
@@ -3650,6 +3894,7 @@ final class EditorStore: ObservableObject {
 
     private func updatePlayhead(fromSourceTime sourceTime: TimeInterval) {
         guard isPlaying,
+              !isScrubbing,
               let context = clipContext(atTimelineTime: playhead) else {
             return
         }
@@ -4058,8 +4303,19 @@ final class EditorStore: ObservableObject {
             cameraPosition: cameraPosition,
             transitionStyle: transitionStyle,
             transitionDuration: transitionDuration,
+            script: Self.normalizedScript(recordingScriptText),
             updatedAt: Date()
         )
+    }
+
+    /// 空白稿件存 nil：旧版项目缺 key、无稿新项目、有稿项目三者在磁盘上
+    /// 保持同一形态，读回时 `?? ""` 即可。
+    private static func normalizedScript(_ text: String?) -> String? {
+        guard
+            let text,
+            !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return text
     }
 
     private func restore(_ snapshot: ScreenFreeProjectSnapshot) async throws {
@@ -4072,6 +4328,8 @@ final class EditorStore: ObservableObject {
         selectedClipID = project.clips.first?.id
         selectedZoomID = project.zooms.first?.id
         selectedRedactionID = project.redactions.first?.id
+        scriptText = snapshot.script ?? ""
+        recordingScriptText = Self.normalizedScript(snapshot.script)
         canvasAspectRatio = snapshot.canvasAspectRatio ?? .source
         canvasContentMode = snapshot.canvasContentMode ?? .fit
         canvasPadding = snapshot.canvasPadding

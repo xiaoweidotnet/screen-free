@@ -105,11 +105,20 @@ final class EditorStoreInteractionTests: XCTestCase {
             accuracy: 0.0001,
             "Releasing the drag must land exactly on the pointer's release position."
         )
-        XCTAssertFalse(store.isPlaying)
+        XCTAssertTrue(
+            store.isPlaying,
+            "A drag that interrupted playback must resume playing on release."
+        )
 
-        store.endScrub()
-        XCTAssertEqual(store.playhead, 2, accuracy: 0.0001)
+        store.isPlaying = false
+        store.scrub(to: 1)
         XCTAssertFalse(store.isPlaying)
+        store.endScrub(at: 1)
+        XCTAssertFalse(
+            store.isPlaying,
+            "Scrubbing while paused must stay paused on release."
+        )
+        XCTAssertEqual(store.playhead, 1, accuracy: 0.0001)
     }
 
     func testAppDelegateRoutesSpaceDirectlyToPlaybackHandler() throws {
@@ -468,6 +477,54 @@ final class EditorStoreInteractionTests: XCTestCase {
         )
     }
 
+    func testQuietMicrophoneRecordingReceivesAutomaticLoudnessRepair() {
+        // Regression: a real wireless-microphone recording measured only
+        // -38 dBFS RMS / -19 dB peak. The editor and exporter must lift it
+        // to a usable loudness instead of playing it back untouched.
+        let mix = RecordedAudioMixStyle(
+            layout: RecordedAudioLayout(
+                systemTrackIndex: nil,
+                microphoneTrackIndex: 0
+            ),
+            systemVolume: 1,
+            microphoneVolume: 1,
+            microphoneMuted: false,
+            trackPeaks: [0.108],
+            trackPeakEnvelopes: [[0.05, 0.108, 0.03]],
+            trackLoudness: [0.012]
+        )
+
+        let gain = mix.gain(forTrackAt: 0)
+
+        XCTAssertGreaterThan(
+            gain,
+            6,
+            "Quiet speech must be boosted toward the loudness target."
+        )
+        XCTAssertLessThanOrEqual(
+            0.108 * gain,
+            0.892,
+            "Loudness repair must never push the track past the peak ceiling."
+        )
+    }
+
+    func testLoudRecordingReceivesNoAutomaticMakeupGain() {
+        let mix = RecordedAudioMixStyle(
+            layout: RecordedAudioLayout(
+                systemTrackIndex: nil,
+                microphoneTrackIndex: 0
+            ),
+            systemVolume: 1,
+            microphoneVolume: 1,
+            microphoneMuted: false,
+            trackPeaks: [0.9],
+            trackPeakEnvelopes: [[0.4, 0.9, 0.3]],
+            trackLoudness: [0.18]
+        )
+
+        XCTAssertEqual(mix.gain(forTrackAt: 0), 1, accuracy: 0.001)
+    }
+
     func testClipVolumeAboveUnityIsAppliedByTheAudioMix() {
         let mix = RecordedAudioMixStyle(
             layout: RecordedAudioLayout(
@@ -485,6 +542,61 @@ final class EditorStoreInteractionTests: XCTestCase {
             1.6,
             accuracy: 0.001
         )
+    }
+
+    func testSelectAllZoomsThenDeleteRemovesEveryBlockAsOneUndoableEdit() {
+        let store = EditorStore()
+        store.project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 10)],
+            zooms: [
+                ZoomEvent(start: 1, duration: 1, scale: 2, focusX: 0.5, focusY: 0.5),
+                ZoomEvent(start: 3, duration: 1, scale: 2, focusX: 0.5, focusY: 0.5),
+                ZoomEvent(start: 5, duration: 1, scale: 2, focusX: 0.5, focusY: 0.5)
+            ]
+        )
+
+        XCTAssertTrue(store.selectAllZooms())
+        XCTAssertEqual(store.selectedZoomIDs.count, 3)
+
+        store.deleteSelectedZooms()
+        XCTAssertTrue(store.project.zooms.isEmpty)
+        XCTAssertTrue(store.selectedZoomIDs.isEmpty)
+
+        store.undoTimelineEdit()
+        XCTAssertEqual(
+            store.project.zooms.count,
+            3,
+            "Deleting a multi-selection must be one undoable edit."
+        )
+    }
+
+    func testMarqueeSelectionPicksOnlyIntersectingZoomsAndDeletesThem() {
+        let store = EditorStore()
+        let first = ZoomEvent(
+            start: 1, duration: 1, scale: 2, focusX: 0.5, focusY: 0.5
+        )
+        let second = ZoomEvent(
+            start: 3, duration: 1, scale: 2, focusX: 0.5, focusY: 0.5
+        )
+        let third = ZoomEvent(
+            start: 6, duration: 1, scale: 2, focusX: 0.5, focusY: 0.5
+        )
+        store.project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 10)],
+            zooms: [first, second, third]
+        )
+
+        store.selectZooms(intersecting: 0.5...4.5)
+        XCTAssertEqual(store.selectedZoomIDs, [first.id, second.id])
+
+        // ⌘-click keeps toggling on top of the marquee selection.
+        store.toggleZoomSelection(third.id)
+        XCTAssertEqual(store.selectedZoomIDs.count, 3)
+        store.toggleZoomSelection(third.id)
+        XCTAssertEqual(store.selectedZoomIDs, [first.id, second.id])
+
+        store.deleteSelectedZooms()
+        XCTAssertEqual(store.project.zooms.map(\.id), [third.id])
     }
 
     func testDeleteCommandRemovesTheSelectedTimelineBlock() {

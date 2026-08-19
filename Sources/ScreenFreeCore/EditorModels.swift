@@ -96,12 +96,15 @@ public struct MouseClick: Identifiable, Equatable, Codable, Sendable {
 public enum AutomaticZoomTriggerPolicy {
     public static let minimumRightHoldDuration: TimeInterval = 0.5
 
+    /// 点击（左键，含旧数据里未标注类型的点击）触发标准时长的自动缩放；
+    /// 右键长按 ≥ minimumRightHoldDuration 触发按住时长加长的缩放；
+    /// 普通鼠标移动与短右键不触发。
     public static func shouldTriggerZoom(for click: MouseClick) -> Bool {
         switch click.button {
         case .right:
             return (click.holdDuration ?? 0) >= minimumRightHoldDuration
         case .left, nil:
-            return false
+            return true
         }
     }
 }

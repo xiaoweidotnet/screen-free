@@ -320,6 +320,44 @@ final class MicrophoneSignalProcessorTests: XCTestCase {
         )
     }
 
+    func testNonInterleavedCaptureBufferIsActuallyAmplifiedOnDisk() throws {
+        // SCStream's microphone output arrives as non-interleaved Float32
+        // planes. The processed buffer that gets appended to the recording
+        // must contain the amplified samples, not an untouched copy.
+        let frames = 2_400
+        let plane = (0..<frames).map { frame in
+            0.01 * sin(2 * Float.pi * 440 * Float(frame) / 48_000)
+        }
+        let processor = MicrophoneSignalProcessor(
+            settings: .microphoneLoudness(
+                reduceNoise: false,
+                normalizeVolume: true
+            )
+        )
+        var boostedRMS: Float = 0
+        for chunk in 0..<10 {
+            let buffer = try makeNonInterleavedFloatSampleBuffer(
+                planes: [plane, plane],
+                presentationTimeStamp: CMTime(
+                    value: CMTimeValue(chunk * frames),
+                    timescale: 48_000
+                )
+            )
+            let processed = try XCTUnwrap(
+                processor.processedSampleBuffer(buffer),
+                "The non-interleaved capture format must be processable."
+            )
+            let written = try samples(from: processed)
+            XCTAssertEqual(written.count, frames * 2)
+            boostedRMS = rms(written)
+        }
+        XCTAssertGreaterThan(
+            boostedRMS,
+            rms(plane) * 2,
+            "Samples written to disk must carry the loudness boost."
+        )
+    }
+
     private func makeSine(
         amplitude: Float,
         frequency: Float,
@@ -408,6 +446,87 @@ final class MicrophoneSignalProcessorTests: XCTestCase {
                 refcon: nil,
                 formatDescription: format,
                 sampleCount: samples.count / 2,
+                presentationTimeStamp: presentationTimeStamp,
+                packetDescriptions: nil,
+                sampleBufferOut: &sampleBuffer
+            ),
+            noErr
+        )
+        return try XCTUnwrap(sampleBuffer)
+    }
+
+    private func makeNonInterleavedFloatSampleBuffer(
+        planes: [[Float]],
+        presentationTimeStamp: CMTime
+    ) throws -> CMSampleBuffer {
+        let channelCount = UInt32(planes.count)
+        let frameCount = planes.first?.count ?? 0
+        var streamDescription = AudioStreamBasicDescription(
+            mSampleRate: 48_000,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat
+                | kAudioFormatFlagIsPacked
+                | kAudioFormatFlagIsNonInterleaved,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: channelCount,
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        var formatDescription: CMAudioFormatDescription?
+        XCTAssertEqual(
+            CMAudioFormatDescriptionCreate(
+                allocator: kCFAllocatorDefault,
+                asbd: &streamDescription,
+                layoutSize: 0,
+                layout: nil,
+                magicCookieSize: 0,
+                magicCookie: nil,
+                extensions: nil,
+                formatDescriptionOut: &formatDescription
+            ),
+            noErr
+        )
+        let format = try XCTUnwrap(formatDescription)
+        let flattened = planes.flatMap { $0 }
+        let byteCount = flattened.count * MemoryLayout<Float>.size
+        var blockBuffer: CMBlockBuffer?
+        XCTAssertEqual(
+            CMBlockBufferCreateWithMemoryBlock(
+                allocator: kCFAllocatorDefault,
+                memoryBlock: nil,
+                blockLength: byteCount,
+                blockAllocator: kCFAllocatorDefault,
+                customBlockSource: nil,
+                offsetToData: 0,
+                dataLength: byteCount,
+                flags: 0,
+                blockBufferOut: &blockBuffer
+            ),
+            kCMBlockBufferNoErr
+        )
+        let block = try XCTUnwrap(blockBuffer)
+        let replaceStatus = flattened.withUnsafeBytes {
+            CMBlockBufferReplaceDataBytes(
+                with: $0.baseAddress!,
+                blockBuffer: block,
+                offsetIntoDestination: 0,
+                dataLength: byteCount
+            )
+        }
+        XCTAssertEqual(replaceStatus, kCMBlockBufferNoErr)
+
+        var sampleBuffer: CMSampleBuffer?
+        XCTAssertEqual(
+            CMAudioSampleBufferCreateWithPacketDescriptions(
+                allocator: kCFAllocatorDefault,
+                dataBuffer: block,
+                dataReady: true,
+                makeDataReadyCallback: nil,
+                refcon: nil,
+                formatDescription: format,
+                sampleCount: frameCount,
                 presentationTimeStamp: presentationTimeStamp,
                 packetDescriptions: nil,
                 sampleBufferOut: &sampleBuffer

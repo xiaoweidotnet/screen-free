@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import ScreenFreeCore
 import SwiftUI
 
@@ -9,13 +10,23 @@ final class RecordingWindowCoordinator {
     private var countdownPanel: RecordingCountdownPanel?
     private var highlightPanel: RecordingHighlightPanel?
     private var drawingPanel: RecordingDrawingPanel?
-    private var speakerNotesPanel: RecordingSpeakerNotesPanel?
+    private var teleprompterPanel: RecordingTeleprompterPanel?
+    private let teleprompterDelegate = TeleprompterPanelDelegate()
+    private var prompterKeyMonitors: [Any] = []
+    private var cancellables: Set<AnyCancellable> = []
     private var hiddenWindows: [NSWindow] = []
     private var applicationPresentation = RecordingApplicationPresentation()
     private let desktopIconController = FinderDesktopIconController()
 
     init(store: EditorStore) {
         self.store = store
+        store.$teleprompterPanelSize
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                self?.applyTeleprompterFrame()
+            }
+            .store(in: &cancellables)
     }
 
     func present(
@@ -71,15 +82,17 @@ final class RecordingWindowCoordinator {
         }
         panel.orderFrontRegardless()
         updateCountdown(onDisplayID: displayID)
-        updateSpeakerNotes(onDisplayID: displayID)
+        updateTeleprompter(onDisplayID: displayID)
+        installPrompterKeyMonitors()
     }
 
     func dismissAndRestoreEditor() {
         panel?.orderOut(nil)
+        removePrompterKeyMonitors()
         countdownPanel?.orderOut(nil)
         highlightPanel?.orderOut(nil)
         drawingPanel?.orderOut(nil)
-        speakerNotesPanel?.orderOut(nil)
+        teleprompterPanel?.orderOut(nil)
         desktopIconController.finish()
         if let policy = applicationPresentation.finish() {
             _ = NSApp.setActivationPolicy(policy)
@@ -106,24 +119,21 @@ final class RecordingWindowCoordinator {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    func updateSpeakerNotes(onDisplayID displayID: UInt32?) {
+    func updateTeleprompter(onDisplayID displayID: UInt32?) {
         guard let store,
-              RecordingSpeakerNotesPresentation.shouldShow(
-                  enabled: store.showSpeakerNotes,
-                  text: store.speakerNotesText
+              RecordingTeleprompterPresentation.shouldShow(
+                  text: store.scriptText
               ) else {
-            speakerNotesPanel?.orderOut(nil)
+            teleprompterPanel?.orderOut(nil)
             return
         }
-        if speakerNotesPanel == nil {
-            let rootView = RecordingSpeakerNotesView(store: store)
+        if teleprompterPanel == nil {
+            let rootView = RecordingTeleprompterView(store: store)
                 .environment(\.locale, store.appLanguage.locale)
-            let panel = RecordingSpeakerNotesPanel(
-                contentRect: NSRect(
-                    x: 0,
-                    y: 0,
-                    width: 560,
-                    height: 170
+            let panel = RecordingTeleprompterPanel(
+                contentRect: CGRect(
+                    origin: .zero,
+                    size: store.teleprompterPanelSize
                 ),
                 styleMask: [.borderless, .nonactivatingPanel],
                 backing: .buffered,
@@ -137,18 +147,107 @@ final class RecordingWindowCoordinator {
             panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             panel.hidesOnDeactivate = false
             panel.isMovableByWindowBackground = true
-            speakerNotesPanel = panel
+            panel.delegate = teleprompterDelegate
+            teleprompterDelegate.onFrameChange = { [weak self] panel in
+                guard panel === self?.teleprompterPanel else { return }
+                let origin = panel.frame.origin
+                UserDefaults.standard.set(
+                    Double(origin.x),
+                    forKey: "teleprompterPanelOriginX"
+                )
+                UserDefaults.standard.set(
+                    Double(origin.y),
+                    forKey: "teleprompterPanelOriginY"
+                )
+            }
+            teleprompterDelegate.onMove = { [weak self] panel in
+                guard panel === self?.teleprompterPanel,
+                      self?.store?.isRecording == true else { return }
+                self?.store?.prompterPaused = true
+            }
+            teleprompterPanel = panel
         }
+        applyTeleprompterFrame(onDisplayID: displayID)
+        teleprompterPanel?.orderFrontRegardless()
+    }
+
+    private func applyTeleprompterFrame(onDisplayID displayID: UInt32? = nil) {
+        guard let store else { return }
         let visibleFrame = (
-            screen(for: displayID) ?? NSScreen.main ?? NSScreen.screens.first
+            screen(for: displayID ?? store.selectedTargetID)
+                ?? NSScreen.main ?? NSScreen.screens.first
         )?.visibleFrame ?? .zero
-        let frame = RecordingSpeakerNotesPresentation.frame(
+        let frame = RecordingTeleprompterPresentation.frame(
             in: visibleFrame,
-            size: speakerNotesPanel?.frame.size
-                ?? CGSize(width: 560, height: 170)
+            size: store.teleprompterPanelSize,
+            savedOrigin: Self.savedTeleprompterOrigin()
         )
-        speakerNotesPanel?.setFrame(frame, display: true)
-        speakerNotesPanel?.orderFrontRegardless()
+        teleprompterPanel?.setFrame(frame, display: true)
+    }
+
+    private static func savedTeleprompterOrigin() -> CGPoint? {
+        let defaults = UserDefaults.standard
+        guard
+            defaults.object(forKey: "teleprompterPanelOriginX") != nil,
+            defaults.object(forKey: "teleprompterPanelOriginY") != nil
+        else { return nil }
+        return CGPoint(
+            x: defaults.double(forKey: "teleprompterPanelOriginX"),
+            y: defaults.double(forKey: "teleprompterPanelOriginY")
+        )
+    }
+
+    func resetTeleprompterPosition() {
+        UserDefaults.standard.removeObject(forKey: "teleprompterPanelOriginX")
+        UserDefaults.standard.removeObject(forKey: "teleprompterPanelOriginY")
+        guard teleprompterPanel != nil else { return }
+        applyTeleprompterFrame()
+    }
+
+    /// ⌥空格 暂停/继续、⌥↑/⌥↓ 调速。全局监听需要辅助功能授权；
+    /// 未授权时只有本应用在前台生效，面板上的控件始终可用。
+    private func installPrompterKeyMonitors() {
+        removePrompterKeyMonitors()
+        prompterKeyMonitors.append(
+            NSEvent.addLocalMonitorForEvents(matching: .keyDown) {
+                [weak self] event in
+                self?.handlePrompterKeyEvent(event) == true ? nil : event
+            }
+        )
+        prompterKeyMonitors.append(
+            NSEvent.addGlobalMonitorForEvents(matching: .keyDown) {
+                [weak self] event in
+                _ = self?.handlePrompterKeyEvent(event)
+            }
+        )
+    }
+
+    private func removePrompterKeyMonitors() {
+        prompterKeyMonitors.forEach { NSEvent.removeMonitor($0) }
+        prompterKeyMonitors.removeAll()
+    }
+
+    private func handlePrompterKeyEvent(_ event: NSEvent) -> Bool {
+        guard let store,
+              store.isRecording,
+              event.modifierFlags.contains(.option),
+              !event.modifierFlags.contains(.command),
+              !event.modifierFlags.contains(.control) else {
+            return false
+        }
+        switch event.keyCode {
+        case 49:
+            store.prompterPaused.toggle()
+            return true
+        case 126:
+            store.prompterSpeed = min(2.5, store.prompterSpeed + 0.25)
+            return true
+        case 125:
+            store.prompterSpeed = max(0.5, store.prompterSpeed - 0.25)
+            return true
+        default:
+            return false
+        }
     }
 
     func updateCountdown(onDisplayID displayID: UInt32?) {
@@ -284,22 +383,62 @@ final class RecordingWindowCoordinator {
     }
 }
 
-struct RecordingSpeakerNotesPresentation {
-    static func shouldShow(enabled: Bool, text: String) -> Bool {
-        enabled && !text.trimmingCharacters(
+struct RecordingTeleprompterPresentation {
+    static let defaultPanelSize = CGSize(width: 560, height: 190)
+    static let minPanelSize = CGSize(width: 320, height: 120)
+    static let maxPanelSize = CGSize(width: 1000, height: 600)
+
+    /// 有稿即显示：空白稿件不弹面板，没有独立开关（ADR 0002）。
+    static func shouldShow(text: String) -> Bool {
+        !text.trimmingCharacters(
             in: .whitespacesAndNewlines
         ).isEmpty
     }
 
+    static func clamped(size: CGSize) -> CGSize {
+        CGSize(
+            width: min(max(size.width, minPanelSize.width), maxPanelSize.width),
+            height: min(max(size.height, minPanelSize.height), maxPanelSize.height)
+        )
+    }
+
+    /// 无记忆位置时底部居中（距底 24pt）；有记忆位置时钳制在可视区内。
     static func frame(
         in visibleFrame: CGRect,
-        size: CGSize
+        size: CGSize,
+        savedOrigin: CGPoint? = nil
     ) -> CGRect {
-        CGRect(
-            x: visibleFrame.midX - size.width / 2,
-            y: visibleFrame.minY + 24,
-            width: size.width,
-            height: size.height
+        let clampedSize = clamped(size: size)
+        let origin: CGPoint
+        if let savedOrigin {
+            origin = clamped(
+                origin: savedOrigin,
+                in: visibleFrame,
+                size: clampedSize
+            )
+        } else {
+            origin = CGPoint(
+                x: visibleFrame.midX - clampedSize.width / 2,
+                y: visibleFrame.minY + 24
+            )
+        }
+        return CGRect(origin: origin, size: clampedSize)
+    }
+
+    static func clamped(
+        origin: CGPoint,
+        in visibleFrame: CGRect,
+        size: CGSize
+    ) -> CGPoint {
+        CGPoint(
+            x: min(
+                max(origin.x, visibleFrame.minX),
+                visibleFrame.maxX - size.width
+            ),
+            y: min(
+                max(origin.y, visibleFrame.minY),
+                visibleFrame.maxY - size.height
+            )
         )
     }
 }
@@ -356,6 +495,22 @@ struct RecordingApplicationPresentation {
         isPresenting = false
         defer { previousPolicy = nil }
         return previousPolicy
+    }
+}
+
+/// 记住用户拖出的提词器位置；录制中拖动面板 = 手动接管（ADR 0002）。
+private final class TeleprompterPanelDelegate: NSObject, NSWindowDelegate {
+    var onFrameChange: ((NSPanel) -> Void)?
+    var onMove: ((NSPanel) -> Void)?
+
+    func windowDidChangeFrame(_ notification: Notification) {
+        guard let panel = notification.object as? NSPanel else { return }
+        onFrameChange?(panel)
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        guard let panel = notification.object as? NSPanel else { return }
+        onMove?(panel)
     }
 }
 
@@ -548,27 +703,98 @@ private final class RecordingDrawingView: NSView {
     }
 }
 
-private final class RecordingSpeakerNotesPanel: NSPanel {
+private final class RecordingTeleprompterPanel: NSPanel {
     override var canBecomeKey: Bool { false }
 }
 
-private struct RecordingSpeakerNotesView: View {
+/// 录制中的提词器：按 `prompterSpeed` 自动滚动稿件，当前段高亮。
+/// 暂停/调速/字号/重置位置都在面板控件行上，⌥ 快捷键是增强路径。
+private struct RecordingTeleprompterView: View {
     @ObservedObject var store: EditorStore
+    @State private var scrollProgress: Double = 0
+    @State private var resizeBase: CGSize?
+    @State private var isHovering = false
+    // 录制期间光标采样与录制计时以 10–30 Hz 重建本视图；实例属性的 timer
+    // 每次重建都会被换成新发布者，且在首次触发（0.1s）前就被下一次重建
+    // 替换——自动滚动因此永远不启动。static 让发布者身份稳定，重订阅
+    // 不会重置计时。
+    private static let tick = Timer.publish(
+        every: 0.1,
+        on: .main,
+        in: .common
+    ).autoconnect()
+
+    private var paragraphs: [String] {
+        store.scriptText
+            .components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private var currentIndex: Int {
+        let count = max(paragraphs.count, 1)
+        return min(Int(scrollProgress * Double(count)), count - 1)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("Speaker Notes", systemImage: "text.bubble")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
-            ScrollView {
-                Text(store.speakerNotesText)
-                    .font(.system(size: 22, weight: .medium))
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.disabled)
+            controlsRow
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach(
+                            Array(paragraphs.enumerated()),
+                            id: \.offset
+                        ) { index, paragraph in
+                            Text(paragraph)
+                                .font(
+                                    .system(
+                                        size: store.prompterFontSize,
+                                        weight: .medium
+                                    )
+                                )
+                                .foregroundStyle(
+                                    index == currentIndex
+                                        ? .white
+                                        : .white.opacity(0.42)
+                                )
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .textSelection(.disabled)
+                                .id(index)
+                        }
+                    }
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 8)
+                }
+                .onReceive(Self.tick) { _ in
+                    advanceAutoScroll()
+                    guard !store.prompterPaused,
+                          !store.isRecordingPaused,
+                          !paragraphs.isEmpty else { return }
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        proxy.scrollTo(currentIndex, anchor: .top)
+                    }
+                }
             }
+            .mask(
+                LinearGradient(
+                    stops: [
+                        .init(color: .clear, location: 0),
+                        .init(color: .black, location: 0.08),
+                        .init(color: .black, location: 0.92),
+                        .init(color: .clear, location: 1),
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
         }
-        .padding(16)
+        .padding(14)
+        .frame(
+            width: store.teleprompterPanelSize.width,
+            height: store.teleprompterPanelSize.height
+        )
         .background(
             .black.opacity(0.84),
             in: RoundedRectangle(cornerRadius: 16)
@@ -577,7 +803,105 @@ private struct RecordingSpeakerNotesView: View {
             RoundedRectangle(cornerRadius: 16)
                 .stroke(.white.opacity(0.18), lineWidth: 1)
         }
-        .padding(5)
+        .overlay(alignment: .bottomTrailing) {
+            resizeGrabber
+        }
+        .onAppear {
+            scrollProgress = 0
+        }
+        .onHover { isHovering = $0 }
+    }
+
+    private func advanceAutoScroll() {
+        guard store.isRecording,
+              !store.isRecordingPaused,
+              !store.prompterPaused,
+              !paragraphs.isEmpty else { return }
+        scrollProgress = min(
+            1,
+            scrollProgress + 0.008 * store.prompterSpeed
+        )
+    }
+
+    private var controlsRow: some View {
+        HStack(spacing: 8) {
+            Label("Teleprompter", systemImage: "text.bubble")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.55))
+            Spacer()
+            Text(String(format: "×%.2f", store.prompterSpeed))
+                .font(.system(size: 10).monospacedDigit())
+                .foregroundStyle(.white.opacity(0.5))
+            controlButton(
+                symbol: store.prompterPaused ? "play.fill" : "pause.fill",
+                help: store.prompterPaused
+                    ? "Resume scrolling"
+                    : "Pause scrolling"
+            ) {
+                store.prompterPaused.toggle()
+            }
+            controlButton(symbol: "tortoise", help: "Scroll slower") {
+                store.prompterSpeed = max(0.5, store.prompterSpeed - 0.25)
+            }
+            controlButton(symbol: "hare", help: "Scroll faster") {
+                store.prompterSpeed = min(2.5, store.prompterSpeed + 0.25)
+            }
+            controlButton(symbol: "textformat.smaller", help: "Smaller text") {
+                store.prompterFontSize = max(16, store.prompterFontSize - 2)
+            }
+            controlButton(symbol: "textformat.larger", help: "Larger text") {
+                store.prompterFontSize = min(48, store.prompterFontSize + 2)
+            }
+            controlButton(
+                symbol: "scope",
+                help: "Reset teleprompter position"
+            ) {
+                store.resetTeleprompterPosition()
+            }
+        }
+        .opacity(isHovering ? 1 : 0.4)
+        .animation(.easeInOut(duration: 0.15), value: isHovering)
+    }
+
+    private func controlButton(
+        symbol: String,
+        help: LocalizedStringKey,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.75))
+                .frame(width: 20, height: 20)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(Text(help))
+    }
+
+    private var resizeGrabber: some View {
+        Image(systemName: "arrow.down.right")
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(.white.opacity(0.55))
+            .frame(width: 18, height: 18)
+            .contentShape(Rectangle())
+            .padding(3)
+            .gesture(
+                DragGesture()
+                    .onChanged { value in
+                        let base = resizeBase ?? store.teleprompterPanelSize
+                        resizeBase = base
+                        store.teleprompterPanelSize =
+                            RecordingTeleprompterPresentation.clamped(
+                                size: CGSize(
+                                    width: base.width + value.translation.width,
+                                    height: base.height + value.translation.height
+                                )
+                            )
+                    }
+                    .onEnded { _ in resizeBase = nil }
+            )
+            .help(Text("Drag to resize"))
     }
 }
 

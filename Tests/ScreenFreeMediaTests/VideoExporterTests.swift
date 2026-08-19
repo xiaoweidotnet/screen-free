@@ -1298,6 +1298,7 @@ final class VideoExporterTests: XCTestCase {
             cameraCornerRadius: 18,
             cameraMirrored: true,
             cameraPosition: .bottomRight,
+            script: "大家好，欢迎来到这一期视频。",
             updatedAt: Date()
         )
         let currentURL = directory.appendingPathComponent("current.screenfree")
@@ -1337,6 +1338,7 @@ final class VideoExporterTests: XCTestCase {
             current.captionVocabulary,
             "ScreenFree, AVFoundation"
         )
+        XCTAssertEqual(current.script, "大家好，欢迎来到这一期视频。")
 
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -1374,6 +1376,7 @@ final class VideoExporterTests: XCTestCase {
         legacyObject.removeValue(forKey: "zoomMotionBlur")
         legacyObject.removeValue(forKey: "panMotionBlur")
         legacyObject.removeValue(forKey: "captionVocabulary")
+        legacyObject.removeValue(forKey: "script")
         if var projectObject = legacyObject["project"] as? [String: Any] {
             projectObject.removeValue(forKey: "shortcuts")
             projectObject.removeValue(forKey: "redactions")
@@ -1415,6 +1418,7 @@ final class VideoExporterTests: XCTestCase {
         XCTAssertNil(restored.zoomMotionBlur)
         XCTAssertNil(restored.panMotionBlur)
         XCTAssertNil(restored.captionVocabulary)
+        XCTAssertNil(restored.script)
         XCTAssertTrue(restored.project.shortcuts.isEmpty)
         XCTAssertTrue(restored.project.redactions.isEmpty)
         XCTAssertEqual(restored.project.duration, 1, accuracy: 0.001)

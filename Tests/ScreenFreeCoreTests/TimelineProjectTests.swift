@@ -884,7 +884,7 @@ final class TimelineProjectTests: XCTestCase {
         )
     }
 
-    func testOnlyLongRightMouseHoldCreatesAutomaticZooms() {
+    func testClicksAndLongRightHoldsCreateAutomaticZooms() {
         var project = TimelineProject(
             clips: [TimelineClip(sourceStart: 0, duration: 8)],
             clicks: [
@@ -920,12 +920,14 @@ final class TimelineProjectTests: XCTestCase {
 
         XCTAssertEqual(
             project.zooms.count,
-            1,
-            "Only an intentional long right-button hold may create an automatic zoom."
+            3,
+            "Left clicks, legacy untyped clicks, and long right holds create automatic zooms; short right clicks and movement do not."
         )
-        let zoom = try? XCTUnwrap(project.zooms.first)
-        XCTAssertEqual(zoom?.focusX ?? -1, 0.75, accuracy: 0.001)
-        XCTAssertEqual(zoom?.focusY ?? -1, 0.35, accuracy: 0.001)
+        XCTAssertEqual(project.zooms[0].focusX, 0.1, accuracy: 0.001)
+        XCTAssertEqual(project.zooms[0].focusY, 0.2, accuracy: 0.001)
+        XCTAssertEqual(project.zooms[2].focusX, 0.75, accuracy: 0.001)
+        XCTAssertTrue(project.zooms.allSatisfy(\.resolvedFollowsCursor))
+        XCTAssertFalse(project.hasOverlappingZooms)
     }
 
     func testRightMouseHoldKeepsAutomaticZoomActiveUntilRelease() {

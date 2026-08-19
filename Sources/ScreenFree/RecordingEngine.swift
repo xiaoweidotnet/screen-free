@@ -4,7 +4,7 @@ import Foundation
 import ScreenCaptureKit
 import ScreenFreeCore
 
-enum CaptureMode: String, CaseIterable, Identifiable {
+enum CaptureMode: String, CaseIterable, Identifiable, Codable {
     case display = "Display"
     case window = "Window"
     case area = "Area"
@@ -18,7 +18,7 @@ enum CaptureContentVisibilityPolicy {
     }
 }
 
-enum SystemAudioCaptureMode: String, CaseIterable, Identifiable, Sendable {
+enum SystemAudioCaptureMode: String, CaseIterable, Identifiable, Sendable, Codable {
     case all = "All applications"
     case selected = "Selected applications"
     case off = "Off"

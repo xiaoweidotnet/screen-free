@@ -78,27 +78,15 @@ final class RecordingHighlightGeometryTests: XCTestCase {
         XCTAssertNil(presentation.finish())
     }
 
-    func testSpeakerNotesVisibilityAndDisplayPlacement() {
+    func testTeleprompterVisibilityAndDisplayPlacement() {
         XCTAssertFalse(
-            RecordingSpeakerNotesPresentation.shouldShow(
-                enabled: false,
-                text: "Present this"
-            )
-        )
-        XCTAssertFalse(
-            RecordingSpeakerNotesPresentation.shouldShow(
-                enabled: true,
-                text: " \n "
-            )
+            RecordingTeleprompterPresentation.shouldShow(text: " \n ")
         )
         XCTAssertTrue(
-            RecordingSpeakerNotesPresentation.shouldShow(
-                enabled: true,
-                text: "Present this"
-            )
+            RecordingTeleprompterPresentation.shouldShow(text: "Present this")
         )
 
-        let frame = RecordingSpeakerNotesPresentation.frame(
+        let frame = RecordingTeleprompterPresentation.frame(
             in: CGRect(
                 x: 1920,
                 y: -360,
@@ -116,6 +104,58 @@ final class RecordingHighlightGeometryTests: XCTestCase {
                 height: 170
             )
         )
+    }
+
+    func testTeleprompterPanelSizeClamping() {
+        XCTAssertEqual(
+            RecordingTeleprompterPresentation.clamped(
+                size: CGSize(width: 200, height: 80)
+            ),
+            CGSize(width: 320, height: 120)
+        )
+        XCTAssertEqual(
+            RecordingTeleprompterPresentation.clamped(
+                size: CGSize(width: 2000, height: 900)
+            ),
+            CGSize(width: 1000, height: 600)
+        )
+        XCTAssertEqual(
+            RecordingTeleprompterPresentation.clamped(
+                size: CGSize(width: 700, height: 300)
+            ),
+            CGSize(width: 700, height: 300)
+        )
+    }
+
+    func testTeleprompterSavedOriginIsUsedAndClampedToVisibleFrame() {
+        let visible = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+
+        let kept = RecordingTeleprompterPresentation.frame(
+            in: visible,
+            size: CGSize(width: 560, height: 190),
+            savedOrigin: CGPoint(x: 100, y: 200)
+        )
+        XCTAssertEqual(kept.origin, CGPoint(x: 100, y: 200))
+        XCTAssertEqual(kept.size, CGSize(width: 560, height: 190))
+
+        let small = CGRect(x: 0, y: 0, width: 800, height: 600)
+        let clampedFrame = RecordingTeleprompterPresentation.frame(
+            in: small,
+            size: CGSize(width: 560, height: 190),
+            savedOrigin: CGPoint(x: 1500, y: 900)
+        )
+        XCTAssertEqual(
+            clampedFrame.origin,
+            CGPoint(x: 800 - 560, y: 600 - 190)
+        )
+
+        let negativeScreen = CGRect(x: 1920, y: -360, width: 2560, height: 1400)
+        let clampedNegative = RecordingTeleprompterPresentation.frame(
+            in: negativeScreen,
+            size: CGSize(width: 560, height: 190),
+            savedOrigin: CGPoint(x: -500, y: -900)
+        )
+        XCTAssertEqual(clampedNegative.origin, CGPoint(x: 1920, y: -360))
 
         var desktopPresentation = RecordingDesktopIconPresentation()
         let inheritedVisible = DesktopIconPreferenceSnapshot(

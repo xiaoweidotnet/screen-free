@@ -37,17 +37,6 @@ struct MainView: View {
             MicrophoneSelectionSheet(store: store)
                 .environment(\.locale, store.appLanguage.locale)
         }
-        .alert(
-            "ScreenFree",
-            isPresented: Binding(
-                get: { store.errorMessage != nil },
-                set: { if !$0 { store.errorMessage = nil } }
-            )
-        ) {
-            Button("OK", role: .cancel) { store.errorMessage = nil }
-        } message: {
-            Text(store.localizedErrorMessage ?? "")
-        }
         .onDeleteCommand {
             _ = store.handleDeleteKey()
         }
@@ -77,6 +66,17 @@ struct MainView: View {
                 return
             }
             context.isHandled = store.handleDeleteKey()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: .screenFreeSelectAllPressed
+            )
+        ) { notification in
+            guard let context =
+                notification.object as? ScreenFreeKeyEventContext else {
+                return
+            }
+            context.isHandled = store.selectAllZooms()
         }
         .onReceive(
             NotificationCenter.default.publisher(
@@ -188,18 +188,31 @@ struct MainView: View {
 
                 Spacer()
 
-                Button {
-                    store.togglePlayback()
-                } label: {
-                    Image(
-                        systemName: store.isPlaying
-                            ? "pause.circle.fill"
-                            : "play.circle.fill"
-                    )
-                    .font(.system(size: 50))
-                    .symbolRenderingMode(.hierarchical)
+                VStack(spacing: 18) {
+                    PlaybackScrubber(store: store)
+                        .padding(.horizontal, 26)
+                        .padding(.vertical, 12)
+                        .background(
+                            Capsule().fill(.black.opacity(0.5))
+                        )
+                        .overlay(
+                            Capsule().stroke(.white.opacity(0.12), lineWidth: 1)
+                        )
+                        .frame(maxWidth: 560)
+
+                    Button {
+                        store.togglePlayback()
+                    } label: {
+                        Image(
+                            systemName: store.isPlaying
+                                ? "pause.circle.fill"
+                                : "play.circle.fill"
+                        )
+                        .font(.system(size: 50))
+                        .symbolRenderingMode(.hierarchical)
+                    }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
                 .padding(.bottom, 26)
             }
         }
@@ -286,7 +299,11 @@ struct MainView: View {
             .buttonStyle(ToolbarButtonStyle())
 
             Button {
-                Task { await store.startOrStopRecording() }
+                if store.isRecording || store.isPreparingRecording {
+                    Task { await store.startOrStopRecording() }
+                } else {
+                    store.presentRecordingSetup()
+                }
             } label: {
                 Label {
                     Text(
@@ -387,7 +404,7 @@ struct MainView: View {
     }
 
     private var primaryRailPanels: [EditorStore.InspectorPanel] {
-        [.recording, .canvas, .cursor, .audio, .privacy]
+        [.canvas, .cursor, .audio, .privacy]
     }
 
     private func selectInspectorPanel(_ panel: EditorStore.InspectorPanel) {
@@ -964,7 +981,7 @@ struct MainView: View {
 
                         if !store.isRecording {
                             Button {
-                                Task { await store.startOrStopRecording() }
+                                store.presentRecordingSetup()
                             } label: {
                                 Label("Start Recording", systemImage: "record.circle")
                                     .padding(.horizontal, 4)
@@ -1016,8 +1033,9 @@ struct MainView: View {
             Text(store.formatted(store.playhead))
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(.secondary)
+                .fixedSize()
 
-            Spacer()
+            PlaybackScrubber(store: store)
 
             Button {
                 showCanvasSizePicker.toggle()
@@ -1431,8 +1449,6 @@ struct MainView: View {
                 Divider().overlay(.white.opacity(0.08))
 
                 switch store.inspectorPanel {
-                case .recording:
-                    RecordingInspector(store: store)
                 case .canvas:
                     CanvasInspector(store: store)
                 case .cursor:
@@ -1479,412 +1495,66 @@ struct MainView: View {
     }
 }
 
-private struct RecordingInspector: View {
+/// 播放进度条：拖动复用时间线播放头的 scrub 管线——播放中拖动会临时暂停、
+/// 松手精确落帧并自动恢复播放，与时间线交互语义完全一致。
+private struct PlaybackScrubber: View {
     @ObservedObject var store: EditorStore
+    @State private var dragFraction: Double?
 
     var body: some View {
-        InspectorSection(title: "Capture source") {
-            Picker("Mode", selection: $store.captureMode) {
-                ForEach(CaptureMode.allCases) { mode in
-                    Text(LocalizedStringKey(mode.rawValue)).tag(mode)
-                }
+        GeometryReader { proxy in
+            let width = max(proxy.size.width, 1)
+            let fraction = min(max(progressFraction, 0), 1)
+            let knobSize: CGFloat = dragFraction == nil ? 9 : 12
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(.white.opacity(0.14))
+                    .frame(height: 5)
+                Capsule()
+                    .fill(StudioTheme.accent.opacity(0.9))
+                    .frame(width: max(5, width * fraction), height: 5)
+                Circle()
+                    .fill(.white)
+                    .frame(width: knobSize, height: knobSize)
+                    .shadow(color: .black.opacity(0.35), radius: 2)
+                    .offset(x: width * fraction - knobSize / 2)
             }
-            .pickerStyle(.segmented)
-            .onChange(of: store.captureMode) {
-                Task {
-                    await store.refreshCaptureTargets()
-                    if store.captureMode == .area {
-                        store.selectRecordingArea()
-                    }
-                }
-            }
-
-            if store.captureMode == .window {
-                Picker("Source", selection: $store.selectedTargetID) {
-                    ForEach(store.captureTargets) { target in
-                        Text(target.title).tag(Optional(target.id))
-                    }
-                }
-                .labelsHidden()
-                .frame(maxWidth: .infinity)
-                .disabled(store.capturePermissionIssue)
-            } else {
-                DisplayTargetPicker(store: store)
-            }
-
-            Button {
-                Task { await store.refreshCaptureTargets() }
-            } label: {
-                Label("Refresh sources", systemImage: "arrow.clockwise")
-            }
-            .buttonStyle(.plain)
-            .font(.system(size: 11))
-
-            if store.capturePermissionIssue {
-                VStack(alignment: .leading, spacing: 8) {
-                    Label(
-                        "Screen recording permission is off.",
-                        systemImage: "exclamationmark.shield"
-                    )
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.orange)
-
-                    HStack {
-                        Button("Request permission") {
-                            Task { await store.requestScreenRecordingPermission() }
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        guard store.sourceURL != nil, store.project.duration > 0 else {
+                            return
                         }
-                        Button("Open Settings") {
-                            store.openScreenRecordingSettings()
-                        }
+                        let fraction = min(max(value.location.x / width, 0), 1)
+                        dragFraction = fraction
+                        store.scrub(to: fraction * store.project.duration)
                     }
-                }
-            }
-
-            if store.captureMode == .area {
-                Button {
-                    store.selectRecordingArea()
-                } label: {
-                    Label("Select area…", systemImage: "viewfinder")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(ToolbarButtonStyle())
-
-                Text(
-                    "\(Int(store.selectedAreaNormalized.width * 100))% × \(Int(store.selectedAreaNormalized.height * 100))%"
-                )
-                .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(.secondary)
-
-                Text("Choose Area, then drag directly on the screen to draw the capture rectangle.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
-        }
-
-        InspectorSection(title: "Recording") {
-            Label("Screen and sound", systemImage: "checkmark.circle.fill")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.green)
-            Text("System audio and microphone are enabled by default.")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-
-            Picker("System audio", selection: $store.systemAudioMode) {
-                ForEach(SystemAudioCaptureMode.allCases) { mode in
-                    Text(LocalizedStringKey(mode.rawValue)).tag(mode)
-                }
-            }
-            .pickerStyle(.menu)
-
-            if store.systemAudioMode == .all {
-                Toggle(
-                    "Boost quiet system audio safely",
-                    isOn: $store.normalizeSystemAudioVolume
-                )
-                .toggleStyle(.switch)
-                Text("Automatic gain is written into the recording and limited before clipping.")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-            }
-
-            if store.systemAudioMode == .selected {
-                if store.audioApplications.isEmpty {
-                    Text("No recordable applications found.")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                } else {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 7) {
-                            ForEach(store.audioApplications) { application in
-                                Toggle(
-                                    application.name,
-                                    isOn: Binding(
-                                        get: {
-                                            store.selectedAudioApplicationIDs
-                                                .contains(application.id)
-                                        },
-                                        set: { selected in
-                                            if selected {
-                                                store.selectedAudioApplicationIDs
-                                                    .insert(application.id)
-                                            } else {
-                                                store.selectedAudioApplicationIDs
-                                                    .remove(application.id)
-                                            }
-                                        }
-                                    )
-                                )
-                                .toggleStyle(.checkbox)
-                            }
+                    .onEnded { value in
+                        defer { dragFraction = nil }
+                        guard store.sourceURL != nil, store.project.duration > 0 else {
+                            return
                         }
+                        let fraction = min(max(value.location.x / width, 0), 1)
+                        store.endScrub(at: fraction * store.project.duration)
                     }
-                    .frame(maxHeight: 132)
-                }
-
-                HStack {
-                    Text(
-                        L10n.text(
-                            "%d applications selected",
-                            language: store.appLanguage,
-                            store.selectedAudioApplicationIDs.count
-                        )
-                    )
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Refresh applications") {
-                        Task { await store.refreshAudioApplications() }
-                    }
-                    .font(.system(size: 10))
-                }
-            }
-
-            Toggle("Microphone", isOn: $store.recordMicrophone)
-                .toggleStyle(.switch)
-            if store.recordMicrophone {
-                Picker("Microphone", selection: $store.selectedMicrophoneID) {
-                    Text("No microphone").tag(Optional<String>.none)
-                    ForEach(store.deviceMonitor.microphones) { device in
-                        Text(
-                            device.name + (
-                                device.isDefault
-                                    ? L10n.text(
-                                        " (default)",
-                                        language: store.appLanguage
-                                    )
-                                    : ""
-                            )
-                        )
-                            .tag(Optional(device.id))
-                    }
-                }
-                .labelsHidden()
-                MicrophoneMeterView(monitor: store.deviceMonitor)
-                Toggle(
-                    "Reduce microphone noise",
-                    isOn: $store.reduceMicrophoneNoise
-                )
-                .toggleStyle(.switch)
-                Toggle(
-                    "Normalize microphone volume",
-                    isOn: $store.normalizeMicrophoneVolume
-                )
-                .toggleStyle(.switch)
-                Text("Microphone enhancement is written to its separate source track while recording.")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-            }
-
-            Picker("Camera", selection: $store.selectedCameraID) {
-                Text("No camera").tag(Optional<String>.none)
-                ForEach(store.deviceMonitor.cameras) { device in
-                    Text(
-                        device.name + (
-                            device.isDefault
-                                ? L10n.text(
-                                    " (default)",
-                                    language: store.appLanguage
-                                )
-                                : ""
-                        )
-                    )
-                        .tag(Optional(device.id))
-                }
-            }
-            .labelsHidden()
-            .onChange(of: store.selectedCameraID) {
-                Task {
-                    await store.deviceMonitor.showCameraPreview(
-                        deviceID: store.selectedCameraID
-                    )
-                }
-            }
-
-            if store.selectedCameraID != nil {
-                Toggle(
-                    "Hide camera preview",
-                    isOn: $store.hideCameraPreview
-                )
-                .toggleStyle(.switch)
-
-                if RecordingCameraPreviewPresentation.shouldShow(
-                    cameraSelected: true,
-                    hidden: store.hideCameraPreview
-                ) {
-                    CameraPreviewView(session: store.deviceMonitor.cameraSession)
-                        .frame(height: 128)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(.white.opacity(0.12), lineWidth: 1)
-                        }
-                } else {
-                    Label(
-                        "Camera preview hidden; recording remains enabled.",
-                        systemImage: "eye.slash"
-                    )
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                }
-            }
-
-            if let deviceError = store.deviceMonitor.deviceError {
-                VStack(alignment: .leading, spacing: 7) {
-                    Label(
-                        L10n.text(deviceError, language: store.appLanguage),
-                        systemImage: "exclamationmark.triangle.fill"
-                    )
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.orange)
-
-                    HStack {
-                        if store.recordMicrophone {
-                            Button("Microphone Settings") {
-                                store.openMicrophoneSettings()
-                            }
-                        }
-                        if store.selectedCameraID != nil {
-                            Button("Camera Settings") {
-                                store.openCameraSettings()
-                            }
-                        }
-                    }
-                    .font(.system(size: 10))
-                }
-            }
-
-            Picker("Countdown", selection: $store.countdownSeconds) {
-                Text("None").tag(0)
-                Text("3 seconds").tag(3)
-                Text("5 seconds").tag(5)
-                Text("10 seconds").tag(10)
-            }
-
-            Picker(
-                "After recording",
-                selection: $store.afterRecordingAction
-            ) {
-                ForEach(AfterRecordingAction.allCases) { action in
-                    Text(LocalizedStringKey(action.rawValue)).tag(action)
-                }
-            }
-            .pickerStyle(.menu)
-
-            if store.afterRecordingAction != .edit {
-                Text("Quick delivery uses the original screen recording. Choose Open editor to compose camera, zoom, cursor, and captions.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
-            }
-
-            Toggle(
-                "Highlight recorded area",
-                isOn: $store.highlightRecordingArea
-            )
-            .toggleStyle(.switch)
-            .onChange(of: store.highlightRecordingArea) {
-                store.refreshRecordingHighlight()
-            }
-
-            Text("The recording border is excluded from the captured video.")
-                .font(.system(size: 11))
-                .foregroundStyle(.tertiary)
-
-            Toggle(
-                "Automatically create zooms",
-                isOn: $store.automaticallyCreateZooms
-            )
-            .toggleStyle(.switch)
-
-            Text("Long right-button holds are kept so automatic zooms can be regenerated later.")
-                .font(.system(size: 11))
-                .foregroundStyle(.tertiary)
-
-            Toggle(
-                "Hide Dock icon while recording",
-                isOn: $store.hideDockIconWhileRecording
-            )
-            .toggleStyle(.switch)
-
-            Text("The Dock icon is restored after stop, cancel, or recording failure.")
-                .font(.system(size: 11))
-                .foregroundStyle(.tertiary)
-
-            #if !APP_STORE
-                Toggle(
-                    "Hide desktop icons while recording",
-                    isOn: $store.hideDesktopIconsWhileRecording
-                )
-                .toggleStyle(.switch)
-
-                Text("Finder refreshes when recording starts and the exact prior desktop setting is restored afterward.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
-            #endif
-
-            Toggle(
-                "Show speaker notes while recording",
-                isOn: $store.showSpeakerNotes
-            )
-            .toggleStyle(.switch)
-            .onChange(of: store.showSpeakerNotes) {
-                store.refreshSpeakerNotes()
-            }
-
-            if store.showSpeakerNotes {
-                ZStack(alignment: .topLeading) {
-                    TextEditor(text: $store.speakerNotesText)
-                        .font(.system(size: 12))
-                        .frame(minHeight: 86)
-                        .scrollContentBackground(.hidden)
-                        .padding(4)
-                        .background(
-                            .black.opacity(0.18),
-                            in: RoundedRectangle(cornerRadius: 9)
-                        )
-                        .onChange(of: store.speakerNotesText) {
-                            store.refreshSpeakerNotes()
-                        }
-                    if store.speakerNotesText.isEmpty {
-                        Text("Enter notes visible only to you…")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.tertiary)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 12)
-                            .allowsHitTesting(false)
-                    }
-                }
-                Text("Speaker notes stay outside the captured video.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
-            }
-
-            Text("ScreenFree captures the native display stream plus a separate 30 fps cursor path and click timeline.")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-
-            Button {
-                Task { await store.startOrStopRecording() }
-            } label: {
-                Label(
-                    store.isRecording ? "Stop and edit" : "Start recording",
-                    systemImage: store.isRecording ? "stop.fill" : "record.circle"
-                )
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(
-                AccentButtonStyle(
-                    colors: store.isRecording || store.isPreparingRecording
-                        ? [StudioTheme.danger, Color(red: 0.65, green: 0.22, blue: 0.22)]
-                        : [StudioTheme.accentBright, StudioTheme.accent]
-                )
             )
         }
+        .frame(height: 22)
+        .opacity(store.sourceURL == nil ? 0.35 : 1)
+        .disabled(store.sourceURL == nil)
+        .accessibilityLabel(Text("Playback position"))
+    }
 
-        StudioCheckView(store: store)
+    private var progressFraction: Double {
+        if let dragFraction { return dragFraction }
+        guard store.project.duration > 0 else { return 0 }
+        return store.playhead / store.project.duration
     }
 }
 
-private struct DisplayTargetPicker: View {
+struct DisplayTargetPicker: View {
     @ObservedObject var store: EditorStore
 
     var body: some View {
@@ -1970,7 +1640,7 @@ private struct DisplayTargetPicker: View {
     }
 }
 
-private struct MicrophoneSelectionSheet: View {
+struct MicrophoneSelectionSheet: View {
     @ObservedObject var store: EditorStore
 
     var body: some View {
@@ -2040,7 +1710,7 @@ private struct MicrophoneSelectionSheet: View {
     }
 }
 
-private struct MicrophoneMeterView: View {
+struct MicrophoneMeterView: View {
     @ObservedObject var monitor: DeviceMonitor
 
     var signalLabel: LocalizedStringKey {
@@ -2089,7 +1759,7 @@ private struct MicrophoneMeterView: View {
     }
 }
 
-private struct StudioCheckView: View {
+struct StudioCheckView: View {
     @ObservedObject var store: EditorStore
     @ObservedObject var monitor: DeviceMonitor
 
@@ -3697,7 +3367,7 @@ private struct ExportInspector: View {
     }
 }
 
-private struct InspectorSection<Content: View>: View {
+struct InspectorSection<Content: View>: View {
     let title: LocalizedStringKey
     @ViewBuilder let content: Content
 
@@ -3718,7 +3388,7 @@ private struct InspectorSection<Content: View>: View {
     }
 }
 
-private struct LabeledSlider<V: BinaryFloatingPoint>: View where V.Stride: BinaryFloatingPoint {
+struct LabeledSlider<V: BinaryFloatingPoint>: View where V.Stride: BinaryFloatingPoint {
     let title: LocalizedStringKey
     @Binding var value: V
     let range: ClosedRange<V>
@@ -3963,7 +3633,7 @@ private struct NativePlayerView: NSViewRepresentable {
     }
 }
 
-private struct ToolbarButtonStyle: ButtonStyle {
+struct ToolbarButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 12, weight: .medium))
@@ -3977,7 +3647,7 @@ private struct ToolbarButtonStyle: ButtonStyle {
     }
 }
 
-private struct AccentButtonStyle: ButtonStyle {
+struct AccentButtonStyle: ButtonStyle {
     let colors: [Color]
 
     func makeBody(configuration: Configuration) -> some View {

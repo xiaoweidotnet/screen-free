@@ -58,4 +58,31 @@ final class TimelineWaveformGeometryTests: XCTestCase {
         XCTAssertEqual(narrow.count, 20)
         XCTAssertEqual(wide.count, 100)
     }
+
+    func testZoomedInClipRendersUpTo2000Bars() {
+        let bars = TimelineWaveformGeometry.bars(
+            samples: Array(repeating: 0.5, count: 3000),
+            sourceDuration: 60,
+            clip: TimelineClip(sourceStart: 0, duration: 60),
+            canvasSize: CGSize(width: 5000, height: 26)
+        )
+
+        XCTAssertEqual(bars.count, 2000)
+        XCTAssertEqual(bars.last?.x ?? 0, 4998.75, accuracy: 0.001)
+    }
+
+    func testFaintNonZeroLevelRendersAVisibleBar() {
+        let bars = TimelineWaveformGeometry.bars(
+            samples: Array(repeating: 0.01, count: 100),
+            sourceDuration: 10,
+            clip: TimelineClip(sourceStart: 0, duration: 10),
+            canvasSize: CGSize(width: 200, height: 26)
+        )
+
+        XCTAssertFalse(bars.isEmpty)
+        XCTAssertTrue(
+            bars.allSatisfy { $0.halfHeight >= 1.0 },
+            "任何非零声音都至少要有 1pt 高的可见波纹"
+        )
+    }
 }

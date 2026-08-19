@@ -15,6 +15,9 @@ extension Notification.Name {
     static let screenFreeRedoPressed = Notification.Name(
         "ScreenFreeRedoPressed"
     )
+    static let screenFreeSelectAllPressed = Notification.Name(
+        "ScreenFreeSelectAllPressed"
+    )
 }
 
 final class ScreenFreeKeyEventContext {
@@ -99,6 +102,19 @@ final class ScreenFreeAppDelegate: NSObject, NSApplicationDelegate {
             )
             return context.isHandled ? nil : event
         }
+        if event.charactersIgnoringModifiers?.lowercased() == "a",
+           modifiers == .command,
+           !hasAttachedSheet,
+           ScreenFreeUndoRouting.shouldRouteToTimeline(
+               firstResponder: firstResponder
+           ) {
+            let context = ScreenFreeKeyEventContext()
+            NotificationCenter.default.post(
+                name: .screenFreeSelectAllPressed,
+                object: context
+            )
+            return context.isHandled ? nil : event
+        }
         if event.charactersIgnoringModifiers?.lowercased() == "z",
            modifiers.contains(.control) != modifiers.contains(.command),
            !modifiers.contains(.option),
@@ -139,7 +155,7 @@ struct ScreenFreeApp: App {
 
     var body: some Scene {
         WindowGroup {
-            MainView(store: store)
+            AppRootView(store: store)
                 .frame(minWidth: 1120, minHeight: 720)
                 .environment(\.locale, store.appLanguage.locale)
                 .onAppear {
@@ -188,7 +204,11 @@ struct ScreenFreeApp: App {
             }
             CommandMenu("Record") {
                 Button(store.isRecording ? "Stop Recording" : "Start Recording") {
-                    Task { await store.startOrStopRecording() }
+                    if store.isRecording || store.isPreparingRecording {
+                        Task { await store.startOrStopRecording() }
+                    } else {
+                        store.presentRecordingSetup()
+                    }
                 }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
                 Button(store.isRecordingPaused ? "Resume" : "Pause") {
@@ -203,6 +223,18 @@ struct ScreenFreeApp: App {
                 }
                 .keyboardShortcut(.space, modifiers: [])
                 .disabled(store.sourceURL == nil)
+                Button("Back 1 Second") { store.skip(by: -1) }
+                    .keyboardShortcut(.leftArrow, modifiers: [.shift])
+                    .disabled(store.sourceURL == nil)
+                Button("Forward 1 Second") { store.skip(by: 1) }
+                    .keyboardShortcut(.rightArrow, modifiers: [.shift])
+                    .disabled(store.sourceURL == nil)
+                Button("Jump to Start") { store.seek(to: 0) }
+                    .keyboardShortcut(.home, modifiers: [])
+                    .disabled(store.sourceURL == nil)
+                Button("Jump to End") { store.seek(to: store.project.duration) }
+                    .keyboardShortcut(.end, modifiers: [])
+                    .disabled(store.sourceURL == nil)
                 Divider()
                 Button("Split Tool") { store.toggleSplitTool() }
                     .keyboardShortcut("b", modifiers: [])
@@ -213,7 +245,14 @@ struct ScreenFreeApp: App {
                 .disabled(store.activeTimelineTool == .selection)
                 Button("Add Cursor Zoom") { store.addZoomAtPlayhead() }
                     .keyboardShortcut("z", modifiers: [.command, .option])
+                Button("Add Privacy Blur") { store.addRedactionAtPlayhead() }
+                    .keyboardShortcut("p", modifiers: [.command, .option])
+                    .disabled(store.sourceURL == nil)
                 Divider()
+                // ⌘A reaches the timeline through the key-event router so
+                // text fields keep their own Select All.
+                Button("Select All Zooms") { store.selectAllZooms() }
+                    .disabled(store.project.zooms.isEmpty)
                 Button("Delete Selection") { store.deleteCurrentSelection() }
                     .keyboardShortcut(.delete, modifiers: [])
                 Divider()

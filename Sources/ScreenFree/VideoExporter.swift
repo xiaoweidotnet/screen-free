@@ -189,9 +189,12 @@ struct VideoExporter {
                     forTrackAt: index,
                     clipVolume: clip.volume
                 ) ?? clip.volume
+                // The mix style already prevents clipping via its own peak
+                // ceiling; 16 only guards against pathological inputs while
+                // still letting automatic loudness repair through.
                 audioParameters[index].setVolume(
                     Float(
-                        combinedGain.clamped(to: 0...2)
+                        combinedGain.clamped(to: 0...16)
                     ),
                     at: insertionTime
                 )
@@ -2316,8 +2319,10 @@ struct VideoExporter {
             shakeThreshold: style.cursorShakeThreshold,
             optimizeRapidChanges: style.optimizeRapidCursorChanges
         )
+        // 30 fps 光标轨迹需要至少同密度的关键帧，15/s 会让跟随相机的
+        // 折线速度转折点在导出里混叠成顿挫。
         let samplesPerSecond = max(
-            15,
+            30,
             Double(motion.exportSampleCount)
                 / max(0.08, motion.transitionDuration)
         )

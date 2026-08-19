@@ -6,6 +6,9 @@ struct TimelineView: View {
     @ObservedObject var store: EditorStore
     @State private var zoomDraftStart: TimeInterval?
     @State private var zoomDraftEnd: TimeInterval?
+    @State private var zoomMarqueeStart: TimeInterval?
+    @State private var zoomMarqueeEnd: TimeInterval?
+    @State private var zoomMarqueeBaseline: Set<UUID> = []
     @State private var splitCursorPushed = false
     @State private var magnificationStartZoom: Double?
 
@@ -725,6 +728,13 @@ struct TimelineView: View {
 
             Color.clear
                 .contentShape(Rectangle())
+                .highPriorityGesture(
+                    zoomMarqueeGesture(
+                        width: width,
+                        duration: duration,
+                        scale: scale
+                    ).modifiers(.shift)
+                )
                 .gesture(
                     rangeCreationGesture(
                         width: width,
@@ -740,6 +750,18 @@ struct TimelineView: View {
                     }
                 )
 
+            if let zoomMarqueeStart, let zoomMarqueeEnd {
+                draftRange(
+                    start: min(zoomMarqueeStart, zoomMarqueeEnd),
+                    end: max(zoomMarqueeStart, zoomMarqueeEnd),
+                    width: width,
+                    duration: duration,
+                    scale: scale,
+                    color: StudioTheme.accent
+                )
+                .allowsHitTesting(false)
+            }
+
             if let zoomDraftStart, let zoomDraftEnd {
                 draftRange(
                     start: min(zoomDraftStart, zoomDraftEnd),
@@ -753,6 +775,7 @@ struct TimelineView: View {
 
             ForEach(store.project.zooms) { zoom in
                 let selected = zoom.id == store.selectedZoomID
+                    || store.selectedZoomIDs.contains(zoom.id)
                 let hovered =
                     store.hoveredTimelineBlock == .zoom(zoom.id)
                 ZoomRangeBar(
@@ -763,8 +786,7 @@ struct TimelineView: View {
                     timelineDuration: duration,
                     timelineScale: scale,
                     onSelect: {
-                        store.selectedZoomID = zoom.id
-                        store.inspectorPanel = .zoom
+                        store.selectZoom(zoom.id)
                         store.seek(to: zoom.start + 0.05)
                     },
                     onRangeChange: { start, zoomDuration, edit in
@@ -794,6 +816,13 @@ struct TimelineView: View {
                         hovering: hovering
                     )
                 }
+                .highPriorityGesture(
+                    TapGesture()
+                        .modifiers(.command)
+                        .onEnded {
+                            store.toggleZoomSelection(zoom.id)
+                        }
+                )
                 .frame(
                     width: max(
                         1,
@@ -837,10 +866,24 @@ struct TimelineView: View {
                     )
 
                     Button(role: .destructive) {
-                        store.selectedZoomID = zoom.id
-                        store.deleteSelectedZoom()
+                        store.deleteZoom(id: zoom.id)
                     } label: {
-                        Label("Delete zoom", systemImage: "trash")
+                        Label(
+                            store.selectedZoomIDs.count > 1
+                                && store.selectedZoomIDs.contains(zoom.id)
+                                ? "Delete selected zooms"
+                                : "Delete zoom",
+                            systemImage: "trash"
+                        )
+                    }
+
+                    Button {
+                        store.selectAllZooms()
+                    } label: {
+                        Label(
+                            "Select all zooms",
+                            systemImage: "checkmark.circle"
+                        )
                     }
                 }
             }
@@ -997,6 +1040,47 @@ struct TimelineView: View {
                 }
             }
         }
+    }
+
+    /// ⇧-drag on the zoom track: rubber-band selection over the swept time
+    /// range. Selection updates live while dragging and extends whatever was
+    /// already selected.
+    private func zoomMarqueeGesture(
+        width: CGFloat,
+        duration: TimeInterval,
+        scale: TimelineScale
+    ) -> some Gesture {
+        DragGesture(minimumDistance: 2)
+            .onChanged { value in
+                let time = scale.time(
+                    atX: value.location.x,
+                    duration: duration,
+                    contentWidth: width
+                )
+                if zoomMarqueeStart == nil {
+                    zoomMarqueeStart = scale.time(
+                        atX: value.startLocation.x,
+                        duration: duration,
+                        contentWidth: width
+                    )
+                    zoomMarqueeBaseline = store.selectedZoomIDs
+                }
+                zoomMarqueeEnd = time
+                if let start = zoomMarqueeStart {
+                    // Rebuild from the drag-start baseline so shrinking the
+                    // marquee deselects blocks that fell back out of it.
+                    store.selectedZoomIDs = zoomMarqueeBaseline
+                    store.selectZooms(
+                        intersecting: min(start, time)...max(start, time),
+                        extendingSelection: true
+                    )
+                }
+            }
+            .onEnded { _ in
+                zoomMarqueeStart = nil
+                zoomMarqueeEnd = nil
+                zoomMarqueeBaseline = []
+            }
     }
 
     private func rangeCreationGesture(
