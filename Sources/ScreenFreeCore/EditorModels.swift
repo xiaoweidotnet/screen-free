@@ -96,12 +96,15 @@ public struct MouseClick: Identifiable, Equatable, Codable, Sendable {
 public enum AutomaticZoomTriggerPolicy {
     public static let minimumRightHoldDuration: TimeInterval = 0.5
 
+    /// 点击（左键，含旧数据里未标注类型的点击）触发标准时长的自动缩放；
+    /// 右键长按 ≥ minimumRightHoldDuration 触发按住时长加长的缩放；
+    /// 普通鼠标移动与短右键不触发。
     public static func shouldTriggerZoom(for click: MouseClick) -> Bool {
         switch click.button {
         case .right:
             return (click.holdDuration ?? 0) >= minimumRightHoldDuration
         case .left, nil:
-            return false
+            return true
         }
     }
 }
@@ -253,45 +256,165 @@ public struct PrivacyRedaction: Identifiable, Equatable, Codable, Sendable {
     }
 }
 
-public enum EmphasisAnnotationKind: String, Codable, CaseIterable, Sendable {
+public enum AnnotationKind: String, Codable, CaseIterable, Sendable {
+    case brush
     case rectangle
+    case ellipse
     case line
+    case arrow
 }
 
-public struct EmphasisAnnotation: Identifiable, Equatable, Codable, Sendable {
+/// A point in normalized 0...1 video-composition coordinates (origin at the
+/// bottom-left, Y up), matching the cursor-sample coordinate space.
+public struct NormalizedPoint: Equatable, Codable, Sendable {
+    public var x: CGFloat
+    public var y: CGFloat
+
+    public init(x: CGFloat, y: CGFloat) {
+        self.x = x
+        self.y = y
+    }
+}
+
+public struct AnnotationColor: Equatable, Codable, Sendable {
+    public var red: Double
+    public var green: Double
+    public var blue: Double
+    public var alpha: Double
+
+    public init(red: Double, green: Double, blue: Double, alpha: Double = 1) {
+        self.red = red
+        self.green = green
+        self.blue = blue
+        self.alpha = alpha
+    }
+
+    public static let red = AnnotationColor(red: 1, green: 0.22, blue: 0.22)
+    public static let yellow = AnnotationColor(red: 1, green: 0.82, blue: 0.12)
+    public static let green = AnnotationColor(red: 0.2, green: 0.9, blue: 0.42)
+    public static let blue = AnnotationColor(red: 0.24, green: 0.6, blue: 1)
+    public static let white = AnnotationColor(red: 1, green: 1, blue: 1)
+
+    public static let palette: [AnnotationColor] = [
+        .red, .yellow, .green, .blue, .white
+    ]
+}
+
+public struct Annotation: Identifiable, Equatable, Codable, Sendable {
     public let id: UUID
-    public var kind: EmphasisAnnotationKind
+    public var kind: AnnotationKind
+    /// Source time of the stroke's mouse-down.
     public var start: TimeInterval
+    /// How long the finished annotation stays visible after the drawing
+    /// gesture completes.
     public var duration: TimeInterval
+    /// How long the drawing gesture took from mouse-down to mouse-up. During
+    /// this window the shape is revealed progressively, matching the live
+    /// drawing; 0 means the annotation appears complete (legacy data).
+    public var drawDuration: TimeInterval
+    public var points: [NormalizedPoint]
     public var normalizedStartX: CGFloat
     public var normalizedStartY: CGFloat
     public var normalizedEndX: CGFloat
     public var normalizedEndY: CGFloat
     public var lineWidth: CGFloat
+    public var color: AnnotationColor
 
     public init(
         id: UUID = UUID(),
-        kind: EmphasisAnnotationKind,
+        kind: AnnotationKind,
         start: TimeInterval,
         duration: TimeInterval = 3,
-        normalizedStartX: CGFloat,
-        normalizedStartY: CGFloat,
-        normalizedEndX: CGFloat,
-        normalizedEndY: CGFloat,
-        lineWidth: CGFloat = 4
+        drawDuration: TimeInterval = 0,
+        points: [NormalizedPoint] = [],
+        normalizedStartX: CGFloat = 0,
+        normalizedStartY: CGFloat = 0,
+        normalizedEndX: CGFloat = 0,
+        normalizedEndY: CGFloat = 0,
+        lineWidth: CGFloat = 4,
+        color: AnnotationColor = .red
     ) {
         self.id = id
         self.kind = kind
         self.start = start
         self.duration = duration
+        self.drawDuration = max(0, drawDuration)
+        self.points = points
         self.normalizedStartX = normalizedStartX
         self.normalizedStartY = normalizedStartY
         self.normalizedEndX = normalizedEndX
         self.normalizedEndY = normalizedEndY
         self.lineWidth = lineWidth
+        self.color = color
     }
 
-    public var end: TimeInterval { start + duration }
+    public var end: TimeInterval {
+        start + drawDuration + duration
+    }
+
+    /// 0 when the stroke begins, 1 once the drawing gesture completes.
+    public func drawProgress(atSourceTime time: TimeInterval) -> Double {
+        guard drawDuration > 0 else { return 1 }
+        return ((time - start) / drawDuration).clamped(to: 0...1)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case kind
+        case start
+        case duration
+        case drawDuration
+        case points
+        case normalizedStartX
+        case normalizedStartY
+        case normalizedEndX
+        case normalizedEndY
+        case lineWidth
+        case color
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        kind = try container.decode(AnnotationKind.self, forKey: .kind)
+        start = try container.decode(TimeInterval.self, forKey: .start)
+        duration = try container.decodeIfPresent(
+            TimeInterval.self,
+            forKey: .duration
+        ) ?? 3
+        drawDuration = try container.decodeIfPresent(
+            TimeInterval.self,
+            forKey: .drawDuration
+        ) ?? 0
+        points = try container.decodeIfPresent(
+            [NormalizedPoint].self,
+            forKey: .points
+        ) ?? []
+        normalizedStartX = try container.decodeIfPresent(
+            CGFloat.self,
+            forKey: .normalizedStartX
+        ) ?? 0
+        normalizedStartY = try container.decodeIfPresent(
+            CGFloat.self,
+            forKey: .normalizedStartY
+        ) ?? 0
+        normalizedEndX = try container.decodeIfPresent(
+            CGFloat.self,
+            forKey: .normalizedEndX
+        ) ?? 0
+        normalizedEndY = try container.decodeIfPresent(
+            CGFloat.self,
+            forKey: .normalizedEndY
+        ) ?? 0
+        lineWidth = try container.decodeIfPresent(
+            CGFloat.self,
+            forKey: .lineWidth
+        ) ?? 4
+        color = try container.decodeIfPresent(
+            AnnotationColor.self,
+            forKey: .color
+        ) ?? .red
+    }
 }
 
 public struct TimelineProject: Equatable, Codable, Sendable {
@@ -302,7 +425,7 @@ public struct TimelineProject: Equatable, Codable, Sendable {
     public var captions: [CaptionCue]
     public var shortcuts: [ShortcutEvent]
     public var redactions: [PrivacyRedaction]
-    public var annotations: [EmphasisAnnotation]
+    public var annotations: [Annotation]
     public var transitions: [ClipTransition]
 
     public init(
@@ -313,7 +436,7 @@ public struct TimelineProject: Equatable, Codable, Sendable {
         captions: [CaptionCue] = [],
         shortcuts: [ShortcutEvent] = [],
         redactions: [PrivacyRedaction] = [],
-        annotations: [EmphasisAnnotation] = [],
+        annotations: [Annotation] = [],
         transitions: [ClipTransition] = []
     ) {
         self.clips = clips
@@ -371,7 +494,7 @@ public struct TimelineProject: Equatable, Codable, Sendable {
             forKey: .redactions
         ) ?? []
         annotations = try container.decodeIfPresent(
-            [EmphasisAnnotation].self,
+            [Annotation].self,
             forKey: .annotations
         ) ?? []
         transitions = try container.decodeIfPresent(
@@ -404,30 +527,13 @@ public struct TimelineProject: Equatable, Codable, Sendable {
         redactions.filter { time >= $0.start && time <= $0.end }
     }
 
+    /// Annotations are recorded in source time (like cursor and click samples);
+    /// they are rendered inside their fade window `[start, end]` in source
+    /// coordinates and mapped to timeline time by the renderer.
     public func activeAnnotations(
-        atTimelineTime time: TimeInterval
-    ) -> [EmphasisAnnotation] {
+        atSourceTime time: TimeInterval
+    ) -> [Annotation] {
         annotations.filter { time >= $0.start && time <= $0.end }
-    }
-
-    @discardableResult
-    public mutating func setAnnotationRange(
-        id: UUID,
-        start: TimeInterval,
-        duration requestedDuration: TimeInterval
-    ) -> Bool {
-        guard let index = annotations.firstIndex(where: { $0.id == id }),
-              duration > 0 else {
-            return false
-        }
-        let safeStart = start.clamped(to: 0...max(0, duration - 0.1))
-        let safeDuration = requestedDuration.clamped(
-            to: 0.1...max(0.1, duration - safeStart)
-        )
-        annotations[index].start = safeStart
-        annotations[index].duration = safeDuration
-        annotations.sort { $0.start < $1.start }
-        return true
     }
 
     @discardableResult
@@ -470,18 +576,6 @@ public struct TimelineProject: Equatable, Codable, Sendable {
                 to: 0.1...max(
                     0.1,
                     timelineDuration - redactions[index].start
-                )
-            )
-        }
-        annotations.removeAll { $0.start >= timelineDuration }
-        for index in annotations.indices {
-            annotations[index].start = annotations[index].start.clamped(
-                to: 0...max(0, timelineDuration - 0.1)
-            )
-            annotations[index].duration = annotations[index].duration.clamped(
-                to: 0.1...max(
-                    0.1,
-                    timelineDuration - annotations[index].start
                 )
             )
         }

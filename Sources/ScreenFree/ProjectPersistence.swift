@@ -61,6 +61,7 @@ struct ScreenFreeProjectSnapshot: Codable {
     var cameraPosition: CameraPosition
     var transitionStyle: ClipTransitionStyle? = nil
     var transitionDuration: Double? = nil
+    var script: String? = nil
     var updatedAt: Date
 }
 

@@ -10,35 +10,79 @@ struct RecordingInteractionArchive: Codable, Equatable, Sendable {
     var cursorSamples: [CursorSample]
     var clicks: [MouseClick]
     var shortcuts: [ShortcutEvent]
+    var annotations: [Annotation]
 
     init(
         version: Int = currentVersion,
         cursorSamples: [CursorSample],
         clicks: [MouseClick],
-        shortcuts: [ShortcutEvent]
+        shortcuts: [ShortcutEvent],
+        annotations: [Annotation] = []
     ) {
         self.version = version
         self.cursorSamples = cursorSamples
         self.clicks = clicks
         self.shortcuts = shortcuts
+        self.annotations = annotations
     }
 
     init(project: TimelineProject) {
         self.init(
             cursorSamples: project.cursorSamples,
             clicks: project.clicks,
-            shortcuts: project.shortcuts
+            shortcuts: project.shortcuts,
+            annotations: project.annotations
         )
     }
 
     var isEmpty: Bool {
         cursorSamples.isEmpty && clicks.isEmpty && shortcuts.isEmpty
+            && annotations.isEmpty
     }
 
     func applying(to project: inout TimelineProject) {
         project.cursorSamples = cursorSamples
         project.clicks = clicks
         project.shortcuts = shortcuts
+        project.annotations = annotations
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case version
+        case cursorSamples
+        case clicks
+        case shortcuts
+        case annotations
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 0
+        cursorSamples = try container.decodeIfPresent(
+            [CursorSample].self,
+            forKey: .cursorSamples
+        ) ?? []
+        clicks = try container.decodeIfPresent(
+            [MouseClick].self,
+            forKey: .clicks
+        ) ?? []
+        shortcuts = try container.decodeIfPresent(
+            [ShortcutEvent].self,
+            forKey: .shortcuts
+        ) ?? []
+        annotations = try container.decodeIfPresent(
+            [Annotation].self,
+            forKey: .annotations
+        ) ?? []
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(version, forKey: .version)
+        try container.encode(cursorSamples, forKey: .cursorSamples)
+        try container.encode(clicks, forKey: .clicks)
+        try container.encode(shortcuts, forKey: .shortcuts)
+        try container.encode(annotations, forKey: .annotations)
     }
 }
 

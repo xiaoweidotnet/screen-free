@@ -146,6 +146,61 @@ final class ZoomMotionTests: XCTestCase {
         )
     }
 
+    func testFollowCursorZoomSmoothsContinuousJitteryMovement() throws {
+        let zoom = ZoomEvent(
+            start: 0,
+            duration: 4,
+            scale: 1.8,
+            focusX: 0.4,
+            focusY: 0.5,
+            followsCursor: true
+        )
+        // 0.2s 周期、±0.1 的三角波抖动：速度低于急变优化阈值、不构成
+        // 可剔除的尖峰，会原样穿过光标预处理——正是"鼠标持续滑动时
+        // 画面晃来晃去"的激励形态。
+        var samples: [CursorSample] = []
+        for index in 0..<120 {
+            let time = Double(index) / 30.0
+            let phase = (time.truncatingRemainder(dividingBy: 0.2)) / 0.2
+            let triangle = 4 * abs(phase - 0.5) - 1
+            samples.append(
+                CursorSample(
+                    time: time,
+                    normalizedX: 0.4 + 0.1 * triangle,
+                    normalizedY: 0.5
+                )
+            )
+        }
+        let project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 4)],
+            zooms: [zoom],
+            cursorSamples: samples
+        )
+
+        var previous = try focus(at: 1.0, project: project)
+        var maxFocusDelta: CGFloat = 0
+        for step in 1...30 {
+            let time = 1.0 + Double(step) / 30.0
+            let current = try focus(at: time, project: project)
+            maxFocusDelta = max(maxFocusDelta, abs(current.x - previous.x))
+            previous = current
+        }
+
+        XCTAssertLessThan(
+            maxFocusDelta,
+            0.025,
+            "The camera must low-pass continuous pointer jitter instead of passing it through as canvas wobble."
+        )
+        for step in 0...30 {
+            let time = 1.0 + Double(step) / 30.0
+            let current = try focus(at: time, project: project)
+            XCTAssertTrue(
+                (0.25...0.55).contains(current.x),
+                "The smoothed focus must stay near the jitter corridor, not drift away."
+            )
+        }
+    }
+
     func testAdjacentFollowCursorZoomsShareOneStableCameraPath() throws {
         let first = ZoomEvent(
             start: 0,
@@ -211,9 +266,11 @@ final class ZoomMotionTests: XCTestCase {
             1,
             accuracy: 0.001
         )
+        // Halfway through the 0.95 s ramp the eased progress is exactly 0.5;
+        // geometric interpolation puts the scale at 2^0.5.
         XCTAssertEqual(
-            try XCTUnwrap(resolve(zoom, at: 1.41, preset: .mellow)).scale,
-            1.5,
+            try XCTUnwrap(resolve(zoom, at: 1.475, preset: .mellow)).scale,
+            sqrt(2),
             accuracy: 0.02
         )
         XCTAssertEqual(
@@ -222,8 +279,8 @@ final class ZoomMotionTests: XCTestCase {
             accuracy: 0.001
         )
         XCTAssertEqual(
-            try XCTUnwrap(resolve(zoom, at: 3.59, preset: .mellow)).scale,
-            1.5,
+            try XCTUnwrap(resolve(zoom, at: 3.525, preset: .mellow)).scale,
+            sqrt(2),
             accuracy: 0.02
         )
         XCTAssertEqual(
@@ -273,7 +330,7 @@ final class ZoomMotionTests: XCTestCase {
                 )
             )
         )
-        XCTAssertEqual(linearCustom.scale, 1.5, accuracy: 0.01)
+        XCTAssertEqual(linearCustom.scale, sqrt(2), accuracy: 0.01)
         let deliberateCustom = try XCTUnwrap(
             ZoomMotionResolver.state(
                 at: 1.3,
@@ -342,7 +399,7 @@ final class ZoomMotionTests: XCTestCase {
             smoothCursorMovement: true
         )
         XCTAssertEqual(disabledBlur, .zero)
-        XCTAssertFalse(
+        XCTAssertTrue(
             AutomaticZoomPolicy.shouldGenerate(
                 enabled: true,
                 clicks: [
@@ -354,7 +411,7 @@ final class ZoomMotionTests: XCTestCase {
                     )
                 ]
             ),
-            "A normal left click must not create an automatic zoom."
+            "A recorded click must create an automatic zoom."
         )
         XCTAssertFalse(
             AutomaticZoomPolicy.shouldGenerate(

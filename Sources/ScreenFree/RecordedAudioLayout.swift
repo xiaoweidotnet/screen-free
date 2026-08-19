@@ -56,19 +56,50 @@ struct RecordedAudioMixStyle: Sendable {
     var microphoneMuted: Bool
     var trackPeaks: [Float] = []
     var trackPeakEnvelopes: [[Float]] = []
+    /// Gated per-track RMS from AudioAnalyzer. Enables automatic loudness
+    /// repair for recordings whose raw capture level is far below target.
+    var trackLoudness: [Float] = []
 
     private static let audiblePeakFloor: Double = 0.001
     private static let targetCombinedPeak = pow(10, -1.0 / 20)
     private static let maximumBoostedCombinedPeak = pow(10, -0.05 / 20)
+    /// Program material this loud (-16 dBFS gated RMS) already sits at a
+    /// comfortable editing loudness and receives no automatic makeup.
+    private static let loudnessTarget: Double = 0.16
+    private static let maximumMicrophoneMakeupGain: Double = 16
+    private static let maximumSystemMakeupGain: Double = 4
+    private static let maximumResolvedGain: Double = 16
+
+    /// Boost-only gain that lifts quiet program material toward the loudness
+    /// target. Capped so the track's own peak cannot exceed the combined-peak
+    /// target: loudness repair must never introduce clipping.
+    private func loudnessMakeupGain(forTrackAt index: Int) -> Double {
+        guard trackLoudness.indices.contains(index) else { return 1 }
+        let loudness = Double(trackLoudness[index])
+        guard loudness.isFinite,
+              loudness > 0.000_1 else {
+            return 1
+        }
+        let maximumMakeup = layout.microphoneTrackIndex == index
+            ? Self.maximumMicrophoneMakeupGain
+            : Self.maximumSystemMakeupGain
+        let desired = (Self.loudnessTarget / loudness)
+            .clamped(to: 1...maximumMakeup)
+        let peak = absolutePeak(forTrackAt: index)
+        guard peak >= Self.audiblePeakFloor else { return 1 }
+        return min(desired, max(1, Self.targetCombinedPeak / peak))
+    }
 
     private func baseGain(forTrackAt index: Int) -> Double {
         if layout.systemTrackIndex == index {
             return systemVolume.clamped(to: 0...2)
+                * loudnessMakeupGain(forTrackAt: index)
         }
         if layout.microphoneTrackIndex == index {
             return microphoneMuted
                 ? 0
                 : microphoneVolume.clamped(to: 0...2)
+                    * loudnessMakeupGain(forTrackAt: index)
         }
         return 1
     }
@@ -168,17 +199,17 @@ struct RecordedAudioMixStyle: Sendable {
             let peak = absolutePeak(forTrackAt: index)
             guard requestedGain > 1,
                   peak >= Self.audiblePeakFloor else {
-                return requestedGain.clamped(to: 0...2)
+                return requestedGain.clamped(to: 0...Self.maximumResolvedGain)
             }
             return min(
                 requestedGain,
                 max(1, Self.targetCombinedPeak / peak)
-            ).clamped(to: 0...2)
+            ).clamped(to: 0...Self.maximumResolvedGain)
         }
 
         return (
             requestedGain * sharedHeadroom(clipVolume: safeClipVolume)
-        ).clamped(to: 0...2)
+        ).clamped(to: 0...Self.maximumResolvedGain)
     }
 
     func gain(forTrackAt index: Int) -> Double {

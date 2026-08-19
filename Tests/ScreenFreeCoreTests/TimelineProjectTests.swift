@@ -2,30 +2,25 @@ import XCTest
 @testable import ScreenFreeCore
 
 final class TimelineProjectTests: XCTestCase {
-    func testAnnotationRoundTripActivationAndRangeClamping() throws {
-        let annotation = EmphasisAnnotation(
-            kind: .rectangle,
+    func testAnnotationSourceTimeActivationFadeWindowAndMigration() throws {
+        let brush = Annotation(
+            kind: .brush,
             start: 1,
-            duration: 2,
-            normalizedStartX: 0.2,
-            normalizedStartY: 0.25,
-            normalizedEndX: 0.8,
-            normalizedEndY: 0.7
+            duration: 3,
+            points: [
+                NormalizedPoint(x: 0.1, y: 0.1),
+                NormalizedPoint(x: 0.4, y: 0.3),
+                NormalizedPoint(x: 0.7, y: 0.6)
+            ],
+            color: .red
         )
         var project = TimelineProject(
             clips: [TimelineClip(sourceStart: 0, duration: 5)],
-            annotations: [annotation]
+            annotations: [brush]
         )
-        XCTAssertTrue(project.activeAnnotations(atTimelineTime: 2).contains(annotation))
-        XCTAssertTrue(
-            project.setAnnotationRange(
-                id: annotation.id,
-                start: 4.5,
-                duration: 4
-            )
-        )
-        XCTAssertEqual(project.annotations[0].start, 4.5, accuracy: 0.001)
-        XCTAssertEqual(project.annotations[0].duration, 0.5, accuracy: 0.001)
+        XCTAssertTrue(project.activeAnnotations(atSourceTime: 2).contains(brush))
+        XCTAssertTrue(project.activeAnnotations(atSourceTime: 3.9).contains(brush))
+        XCTAssertTrue(project.activeAnnotations(atSourceTime: 4.1).isEmpty)
 
         let decoded = try JSONDecoder().decode(
             TimelineProject.self,
@@ -33,15 +28,82 @@ final class TimelineProjectTests: XCTestCase {
         )
         XCTAssertEqual(decoded, project)
 
-        let legacy = """
+        let legacyAnnotation = """
+        {"id":"\(brush.id.uuidString)","kind":"rectangle","start":1,"duration":2,\
+        "normalizedStartX":0.2,"normalizedStartY":0.25,"normalizedEndX":0.8,\
+        "normalizedEndY":0.7,"lineWidth":4}
+        """.data(using: .utf8)!
+        let decodedLegacy = try JSONDecoder().decode(
+            Annotation.self,
+            from: legacyAnnotation
+        )
+        XCTAssertEqual(decodedLegacy.kind, .rectangle)
+        XCTAssertEqual(decodedLegacy.points, [])
+        XCTAssertEqual(decodedLegacy.color, .red)
+
+        let legacyProject = """
         {"clips":[],"zooms":[],"cursorSamples":[],"clicks":[],"captions":[],"shortcuts":[],"redactions":[]}
         """.data(using: .utf8)!
         XCTAssertTrue(
             try JSONDecoder().decode(
                 TimelineProject.self,
-                from: legacy
+                from: legacyProject
             ).annotations.isEmpty
         )
+    }
+
+    func testAnnotationDrawingProgressWindowAndLegacyMigration() throws {
+        let box = Annotation(
+            kind: .rectangle,
+            start: 1,
+            duration: 3,
+            drawDuration: 2,
+            normalizedStartX: 0.2,
+            normalizedStartY: 0.2,
+            normalizedEndX: 0.8,
+            normalizedEndY: 0.8,
+            color: .red
+        )
+        let project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 10)],
+            annotations: [box]
+        )
+
+        // Visible from the stroke's mouse-down through drawing plus the
+        // full fade window; nothing before the stroke begins.
+        XCTAssertTrue(project.activeAnnotations(atSourceTime: 0.99).isEmpty)
+        XCTAssertTrue(project.activeAnnotations(atSourceTime: 1).contains(box))
+        XCTAssertTrue(
+            project.activeAnnotations(atSourceTime: 5.5).contains(box)
+        )
+        XCTAssertTrue(project.activeAnnotations(atSourceTime: 6.01).isEmpty)
+
+        XCTAssertEqual(box.drawProgress(atSourceTime: 0.5), 0)
+        XCTAssertEqual(box.drawProgress(atSourceTime: 1), 0)
+        XCTAssertEqual(box.drawProgress(atSourceTime: 2), 0.5)
+        XCTAssertEqual(box.drawProgress(atSourceTime: 3), 1)
+        XCTAssertEqual(box.drawProgress(atSourceTime: 5), 1)
+
+        let decoded = try JSONDecoder().decode(
+            Annotation.self,
+            from: JSONEncoder().encode(box)
+        )
+        XCTAssertEqual(decoded, box)
+        XCTAssertEqual(decoded.end, 6)
+
+        // Legacy payloads without drawDuration appear complete instantly and
+        // keep their original visibility window.
+        let legacy = """
+        {"kind":"rectangle","start":1,"duration":2,"normalizedStartX":0.2,\
+        "normalizedStartY":0.25,"normalizedEndX":0.8,"normalizedEndY":0.7}
+        """.data(using: .utf8)!
+        let decodedLegacy = try JSONDecoder().decode(
+            Annotation.self,
+            from: legacy
+        )
+        XCTAssertEqual(decodedLegacy.drawDuration, 0)
+        XCTAssertEqual(decodedLegacy.end, 3)
+        XCTAssertEqual(decodedLegacy.drawProgress(atSourceTime: 1), 1)
     }
 
     func testTimelineScaleFitsZoomsAndPreservesDragMapping() {
@@ -822,7 +884,7 @@ final class TimelineProjectTests: XCTestCase {
         )
     }
 
-    func testOnlyLongRightMouseHoldCreatesAutomaticZooms() {
+    func testClicksAndLongRightHoldsCreateAutomaticZooms() {
         var project = TimelineProject(
             clips: [TimelineClip(sourceStart: 0, duration: 8)],
             clicks: [
@@ -858,12 +920,14 @@ final class TimelineProjectTests: XCTestCase {
 
         XCTAssertEqual(
             project.zooms.count,
-            1,
-            "Only an intentional long right-button hold may create an automatic zoom."
+            3,
+            "Left clicks, legacy untyped clicks, and long right holds create automatic zooms; short right clicks and movement do not."
         )
-        let zoom = try? XCTUnwrap(project.zooms.first)
-        XCTAssertEqual(zoom?.focusX ?? -1, 0.75, accuracy: 0.001)
-        XCTAssertEqual(zoom?.focusY ?? -1, 0.35, accuracy: 0.001)
+        XCTAssertEqual(project.zooms[0].focusX, 0.1, accuracy: 0.001)
+        XCTAssertEqual(project.zooms[0].focusY, 0.2, accuracy: 0.001)
+        XCTAssertEqual(project.zooms[2].focusX, 0.75, accuracy: 0.001)
+        XCTAssertTrue(project.zooms.allSatisfy(\.resolvedFollowsCursor))
+        XCTAssertFalse(project.hasOverlappingZooms)
     }
 
     func testRightMouseHoldKeepsAutomaticZoomActiveUntilRelease() {

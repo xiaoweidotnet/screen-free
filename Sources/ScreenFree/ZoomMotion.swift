@@ -13,11 +13,11 @@ enum ZoomMotionPreset: String, CaseIterable, Codable, Identifiable, Sendable {
 
     var transitionDuration: TimeInterval {
         switch self {
-        case .slow: return 1.05
-        case .mellow: return 0.82
+        case .slow: return 1.2
+        case .mellow: return 0.95
         case .quick: return 0.46
         case .rapid: return 0.24
-        case .custom: return 0.82
+        case .custom: return 0.95
         }
     }
 
@@ -150,7 +150,7 @@ struct ZoomMotionStyle: Codable, Equatable, Sendable {
 
     init(
         preset: ZoomMotionPreset,
-        customTransitionDuration: TimeInterval = 0.82,
+        customTransitionDuration: TimeInterval = 0.95,
         customEasing: CubicBezierEasing = .defaultCurve
     ) {
         self.preset = preset
@@ -188,7 +188,11 @@ struct ResolvedZoomMotion {
 }
 
 enum ZoomFocusResolver {
-    private static let followDelay: TimeInterval = 0.36
+    /// 跟随相机的一阶低通时间常数：越大焦点越稳、跟随越迟。
+    /// 之前用 0.36s 的 3 抽头平均，鼠标持续滑动时 30fps 轨迹几乎原样
+    /// 穿透成焦点，被放大倍数乘性放大成画面晃动（导出/预览同源）。
+    private static let followTimeConstant: TimeInterval = 0.3
+    private static let simulationStep: TimeInterval = 1.0 / 30.0
 
     static func focus(
         at time: TimeInterval,
@@ -213,45 +217,44 @@ enum ZoomFocusResolver {
             containing: zoomState.zoom,
             zooms: project.zooms
         )
-        let availableDelay = max(0, time - chainStart)
-        let delay = min(followDelay, availableDelay)
-        let sampleTimes = [
-            time - delay,
-            time - delay * 0.5,
-            time
-        ]
-        let weights: [CGFloat] = [0.5, 0.32, 0.18]
         let cursorSamples = processedCursorSamples
             ?? project.processedCursorSamples(
                 removeShakes: removeCursorShakes,
                 shakeThreshold: cursorShakeThreshold,
                 optimizeRapidChanges: optimizeRapidCursorChanges
             )
-        var weightedX: CGFloat = 0
-        var weightedY: CGFloat = 0
-        var totalWeight: CGFloat = 0
 
-        for (sampleTime, weight) in zip(sampleTimes, weights) {
-            guard let cursor = project.cursorSample(
+        func cursor(at sampleTime: TimeInterval) -> CGPoint? {
+            project.cursorSample(
                 atTimelineTime: sampleTime,
                 using: cursorSamples,
                 freezeBeforeEnd: cursorTailFreeze,
                 loopToStart: cursorLoopToStart,
                 smoothMovement: smoothCursorMovement
-            ) else {
-                continue
+            ).map {
+                CGPoint(x: $0.normalizedX, y: $0.normalizedY)
             }
-            weightedX += cursor.normalizedX * weight
-            weightedY += cursor.normalizedY * weight
-            totalWeight += weight
         }
 
-        guard totalWeight > 0 else {
+        // 从缩放链起点的光标位置初始化相机，再沿时间轴以 30Hz 步进做
+        // 因果一阶低通。链内所有缩放共享同一起点与同一条模拟轨迹，
+        // 保证相邻缩放边界处焦点连续。
+        guard var smoothed = cursor(at: chainStart) else {
             return CGPoint(x: zoomState.focusX, y: zoomState.focusY)
         }
+        var simulated = chainStart
+        while time - simulated > simulationStep / 2 {
+            let step = min(simulationStep, time - simulated)
+            simulated += step
+            if let target = cursor(at: simulated) {
+                let alpha = 1 - exp(-step / followTimeConstant)
+                smoothed.x += alpha * (target.x - smoothed.x)
+                smoothed.y += alpha * (target.y - smoothed.y)
+            }
+        }
         return CGPoint(
-            x: (weightedX / totalWeight).clamped(to: 0...1),
-            y: (weightedY / totalWeight).clamped(to: 0...1)
+            x: smoothed.x.clamped(to: 0...1),
+            y: smoothed.y.clamped(to: 0...1)
         )
     }
 
@@ -308,7 +311,7 @@ enum ZoomMotionResolver {
                     )
                     return ResolvedZoomMotion(
                         zoom: next.zoom,
-                        scale: interpolate(
+                        scale: interpolateScale(
                             from: segment.zoom.scale,
                             to: next.zoom.scale,
                             progress: progress
@@ -353,7 +356,7 @@ enum ZoomMotionResolver {
                 let progress = motion.easedProgress(rawProgress)
                 return ResolvedZoomMotion(
                     zoom: segment.zoom,
-                    scale: interpolate(
+                    scale: interpolateScale(
                         from: CGFloat(previous.zoom.scale),
                         to: CGFloat(segment.zoom.scale),
                         progress: progress
@@ -385,7 +388,11 @@ enum ZoomMotionResolver {
             }
             return ResolvedZoomMotion(
                 zoom: segment.zoom,
-                scale: 1 + (segment.zoom.scale - 1) * progress,
+                scale: interpolateScale(
+                    from: 1,
+                    to: segment.zoom.scale,
+                    progress: progress
+                ),
                 focusX: CGFloat(segment.zoom.focusX),
                 focusY: CGFloat(segment.zoom.focusY)
             )
@@ -458,6 +465,21 @@ enum ZoomMotionResolver {
         progress: CGFloat
     ) -> CGFloat {
         start + (end - start) * progress.clamped(to: 0...1)
+    }
+
+    /// Magnification is interpolated geometrically (constant relative zoom
+    /// speed). Linear scale interpolation shrinks the visible area fastest
+    /// right at the start of a zoom-in, which reads as an abrupt lunge.
+    private static func interpolateScale(
+        from start: CGFloat,
+        to end: CGFloat,
+        progress: CGFloat
+    ) -> CGFloat {
+        let clamped = progress.clamped(to: 0...1)
+        guard start > 0, end > 0 else {
+            return interpolate(from: start, to: end, progress: clamped)
+        }
+        return start * pow(end / start, clamped)
     }
 }
 

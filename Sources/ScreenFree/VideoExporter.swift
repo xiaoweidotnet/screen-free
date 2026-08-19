@@ -189,9 +189,12 @@ struct VideoExporter {
                     forTrackAt: index,
                     clipVolume: clip.volume
                 ) ?? clip.volume
+                // The mix style already prevents clipping via its own peak
+                // ceiling; 16 only guards against pathological inputs while
+                // still letting automatic loudness repair through.
                 audioParameters[index].setVolume(
                     Float(
-                        combinedGain.clamped(to: 0...2)
+                        combinedGain.clamped(to: 0...16)
                     ),
                     at: insertionTime
                 )
@@ -730,9 +733,9 @@ struct VideoExporter {
         let redactions = project.activeRedactions(
             atTimelineTime: timelineTime
         )
-        let annotations = project.activeAnnotations(
-            atTimelineTime: timelineTime
-        )
+        let annotations = sourceTime.map {
+            project.activeAnnotations(atSourceTime: $0)
+        } ?? []
         let motionBlur = MotionBlurResolver.resolve(
             at: timelineTime,
             project: project,
@@ -967,20 +970,22 @@ struct VideoExporter {
         }
 
         for annotation in annotations {
-            let start = CGPoint(
-                x: videoFrame.minX
-                    + videoFrame.width * annotation.normalizedStartX,
-                y: videoFrame.maxY
-                    - videoFrame.height * annotation.normalizedStartY
-            )
-            let end = CGPoint(
-                x: videoFrame.minX
-                    + videoFrame.width * annotation.normalizedEndX,
-                y: videoFrame.maxY
-                    - videoFrame.height * annotation.normalizedEndY
-            )
+            let path = annotationCGPath(
+                for: annotation,
+                progress: annotation.drawProgress(
+                    atSourceTime: sourceTime ?? annotation.start
+                )
+            ) { x, y in
+                let point = self.point(
+                    x: x,
+                    y: y,
+                    in: videoFrame,
+                    cropGeometry: cropGeometry
+                )
+                return CGPoint(x: point.x, y: bounds.height - point.y)
+            }
             context.saveGState()
-            context.setStrokeColor(NSColor.systemOrange.cgColor)
+            context.setStrokeColor(annotation.color.nsColor.cgColor)
             context.setLineWidth(annotation.lineWidth)
             context.setLineCap(.round)
             context.setLineJoin(.round)
@@ -989,25 +994,7 @@ struct VideoExporter {
                 blur: 2,
                 color: NSColor.black.withAlphaComponent(0.7).cgColor
             )
-            switch annotation.kind {
-            case .rectangle:
-                context.addPath(
-                    CGPath(
-                        roundedRect: CGRect(
-                            x: min(start.x, end.x),
-                            y: min(start.y, end.y),
-                            width: abs(end.x - start.x),
-                            height: abs(end.y - start.y)
-                        ),
-                        cornerWidth: 10,
-                        cornerHeight: 10,
-                        transform: nil
-                    )
-                )
-            case .line:
-                context.move(to: start)
-                context.addLine(to: end)
-            }
+            context.addPath(path)
             context.strokePath()
             context.restoreGState()
         }
@@ -1481,10 +1468,12 @@ struct VideoExporter {
             to: parentLayer,
             videoFrame: videoLayer.frame
         )
-        addEmphasisAnnotations(
+        addAnnotations(
             project.annotations,
+            project: project,
             to: parentLayer,
-            videoFrame: videoLayer.frame
+            videoFrame: videoLayer.frame,
+            cropGeometry: cropGeometry
         )
 
         if style.showCaptions, !project.captions.isEmpty {
@@ -1644,47 +1633,27 @@ struct VideoExporter {
         }
     }
 
-    private func addEmphasisAnnotations(
-        _ annotations: [EmphasisAnnotation],
+    private func addAnnotations(
+        _ annotations: [Annotation],
+        project: TimelineProject,
         to parentLayer: CALayer,
-        videoFrame: CGRect
+        videoFrame: CGRect,
+        cropGeometry: CanvasCropGeometry
     ) {
         for annotation in annotations {
-            let start = CGPoint(
-                x: videoFrame.minX
-                    + videoFrame.width * annotation.normalizedStartX,
-                y: videoFrame.minY
-                    + videoFrame.height * annotation.normalizedStartY
-            )
-            let end = CGPoint(
-                x: videoFrame.minX
-                    + videoFrame.width * annotation.normalizedEndX,
-                y: videoFrame.minY
-                    + videoFrame.height * annotation.normalizedEndY
-            )
-            let path = CGMutablePath()
-            switch annotation.kind {
-            case .rectangle:
-                path.addRoundedRect(
-                    in: CGRect(
-                        x: min(start.x, end.x),
-                        y: min(start.y, end.y),
-                        width: abs(end.x - start.x),
-                        height: abs(end.y - start.y)
-                    ),
-                    cornerWidth: 10,
-                    cornerHeight: 10
-                )
-            case .line:
-                path.move(to: start)
-                path.addLine(to: end)
+            guard let timelineStart = project.timelineTime(
+                forSourceTime: annotation.start
+            ) else {
+                continue
             }
-
+            let path = annotationCGPath(for: annotation) { x, y in
+                point(x: x, y: y, in: videoFrame, cropGeometry: cropGeometry)
+            }
             let layer = CAShapeLayer()
             layer.frame = parentLayer.bounds
             layer.path = path
             layer.fillColor = nil
-            layer.strokeColor = NSColor.systemOrange.cgColor
+            layer.strokeColor = annotation.color.nsColor.cgColor
             layer.lineWidth = annotation.lineWidth
             layer.lineCap = .round
             layer.lineJoin = .round
@@ -1693,16 +1662,55 @@ struct VideoExporter {
             layer.shadowRadius = 2
             layer.opacity = 0
 
+            if annotation.drawDuration > 0 {
+                let draw = CAKeyframeAnimation(keyPath: "path")
+                draw.values = annotationDrawSamplePaths(
+                    for: annotation,
+                    videoFrame: videoFrame,
+                    cropGeometry: cropGeometry
+                )
+                draw.calculationMode = .discrete
+                draw.beginTime = AVCoreAnimationBeginTimeAtZero
+                    + timelineStart
+                draw.duration = annotation.drawDuration
+                draw.isRemovedOnCompletion = false
+                draw.fillMode = .both
+                layer.add(draw, forKey: "annotationDrawProgress")
+            }
+
             let visibility = CAKeyframeAnimation(keyPath: "opacity")
             visibility.values = [0, 1, 1, 0]
             visibility.keyTimes = [0, 0.01, 0.99, 1]
             visibility.beginTime = AVCoreAnimationBeginTimeAtZero
-                + annotation.start
-            visibility.duration = annotation.duration
+                + timelineStart
+            visibility.duration = annotation.drawDuration
+                + annotation.duration
             visibility.isRemovedOnCompletion = false
             visibility.fillMode = .backwards
             layer.add(visibility, forKey: "annotationVisibility")
             parentLayer.addSublayer(layer)
+        }
+    }
+
+    /// Samples the shared progressive annotation geometry at display rate so
+    /// the Core Animation export layer replays the drawing gesture the same
+    /// way the preview and current-frame renderers do.
+    private func annotationDrawSamplePaths(
+        for annotation: Annotation,
+        videoFrame: CGRect,
+        cropGeometry: CanvasCropGeometry
+    ) -> [Any] {
+        let sampleCount = max(
+            2,
+            min(120, Int((annotation.drawDuration * 60).rounded()))
+        )
+        return (0...sampleCount).map { step in
+            annotationCGPath(
+                for: annotation,
+                progress: Double(step) / Double(sampleCount)
+            ) { x, y in
+                point(x: x, y: y, in: videoFrame, cropGeometry: cropGeometry)
+            }
         }
     }
 
@@ -2311,8 +2319,10 @@ struct VideoExporter {
             shakeThreshold: style.cursorShakeThreshold,
             optimizeRapidChanges: style.optimizeRapidCursorChanges
         )
+        // 30 fps 光标轨迹需要至少同密度的关键帧，15/s 会让跟随相机的
+        // 折线速度转折点在导出里混叠成顿挫。
         let samplesPerSecond = max(
-            15,
+            30,
             Double(motion.exportSampleCount)
                 / max(0.08, motion.transitionDuration)
         )

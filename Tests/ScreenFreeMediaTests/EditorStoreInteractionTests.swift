@@ -77,6 +77,50 @@ final class EditorStoreInteractionTests: XCTestCase {
         XCTAssertFalse(store.isPlaying)
     }
 
+    func testTimelineScrubPausesPlaybackAndClampsPlayhead() {
+        let store = EditorStore()
+        store.sourceURL = URL(fileURLWithPath: "/tmp/scrub-shortcut.mov")
+        store.project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 5)]
+        )
+        store.isPlaying = true
+
+        store.scrub(to: 3)
+        XCTAssertFalse(
+            store.isPlaying,
+            "Dragging the playhead must pause playback so the periodic time observer cannot fight the drag."
+        )
+        XCTAssertEqual(store.playhead, 3, accuracy: 0.0001)
+
+        store.scrub(to: -2)
+        XCTAssertEqual(store.playhead, 0, accuracy: 0.0001)
+
+        store.scrub(to: 99)
+        XCTAssertEqual(store.playhead, 5, accuracy: 0.0001)
+
+        store.endScrub(at: 2)
+        XCTAssertEqual(
+            store.playhead,
+            2,
+            accuracy: 0.0001,
+            "Releasing the drag must land exactly on the pointer's release position."
+        )
+        XCTAssertTrue(
+            store.isPlaying,
+            "A drag that interrupted playback must resume playing on release."
+        )
+
+        store.isPlaying = false
+        store.scrub(to: 1)
+        XCTAssertFalse(store.isPlaying)
+        store.endScrub(at: 1)
+        XCTAssertFalse(
+            store.isPlaying,
+            "Scrubbing while paused must stay paused on release."
+        )
+        XCTAssertEqual(store.playhead, 1, accuracy: 0.0001)
+    }
+
     func testAppDelegateRoutesSpaceDirectlyToPlaybackHandler() throws {
         let appDelegate = ScreenFreeAppDelegate()
         var invocationCount = 0
@@ -433,6 +477,54 @@ final class EditorStoreInteractionTests: XCTestCase {
         )
     }
 
+    func testQuietMicrophoneRecordingReceivesAutomaticLoudnessRepair() {
+        // Regression: a real wireless-microphone recording measured only
+        // -38 dBFS RMS / -19 dB peak. The editor and exporter must lift it
+        // to a usable loudness instead of playing it back untouched.
+        let mix = RecordedAudioMixStyle(
+            layout: RecordedAudioLayout(
+                systemTrackIndex: nil,
+                microphoneTrackIndex: 0
+            ),
+            systemVolume: 1,
+            microphoneVolume: 1,
+            microphoneMuted: false,
+            trackPeaks: [0.108],
+            trackPeakEnvelopes: [[0.05, 0.108, 0.03]],
+            trackLoudness: [0.012]
+        )
+
+        let gain = mix.gain(forTrackAt: 0)
+
+        XCTAssertGreaterThan(
+            gain,
+            6,
+            "Quiet speech must be boosted toward the loudness target."
+        )
+        XCTAssertLessThanOrEqual(
+            0.108 * gain,
+            0.892,
+            "Loudness repair must never push the track past the peak ceiling."
+        )
+    }
+
+    func testLoudRecordingReceivesNoAutomaticMakeupGain() {
+        let mix = RecordedAudioMixStyle(
+            layout: RecordedAudioLayout(
+                systemTrackIndex: nil,
+                microphoneTrackIndex: 0
+            ),
+            systemVolume: 1,
+            microphoneVolume: 1,
+            microphoneMuted: false,
+            trackPeaks: [0.9],
+            trackPeakEnvelopes: [[0.4, 0.9, 0.3]],
+            trackLoudness: [0.18]
+        )
+
+        XCTAssertEqual(mix.gain(forTrackAt: 0), 1, accuracy: 0.001)
+    }
+
     func testClipVolumeAboveUnityIsAppliedByTheAudioMix() {
         let mix = RecordedAudioMixStyle(
             layout: RecordedAudioLayout(
@@ -450,6 +542,61 @@ final class EditorStoreInteractionTests: XCTestCase {
             1.6,
             accuracy: 0.001
         )
+    }
+
+    func testSelectAllZoomsThenDeleteRemovesEveryBlockAsOneUndoableEdit() {
+        let store = EditorStore()
+        store.project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 10)],
+            zooms: [
+                ZoomEvent(start: 1, duration: 1, scale: 2, focusX: 0.5, focusY: 0.5),
+                ZoomEvent(start: 3, duration: 1, scale: 2, focusX: 0.5, focusY: 0.5),
+                ZoomEvent(start: 5, duration: 1, scale: 2, focusX: 0.5, focusY: 0.5)
+            ]
+        )
+
+        XCTAssertTrue(store.selectAllZooms())
+        XCTAssertEqual(store.selectedZoomIDs.count, 3)
+
+        store.deleteSelectedZooms()
+        XCTAssertTrue(store.project.zooms.isEmpty)
+        XCTAssertTrue(store.selectedZoomIDs.isEmpty)
+
+        store.undoTimelineEdit()
+        XCTAssertEqual(
+            store.project.zooms.count,
+            3,
+            "Deleting a multi-selection must be one undoable edit."
+        )
+    }
+
+    func testMarqueeSelectionPicksOnlyIntersectingZoomsAndDeletesThem() {
+        let store = EditorStore()
+        let first = ZoomEvent(
+            start: 1, duration: 1, scale: 2, focusX: 0.5, focusY: 0.5
+        )
+        let second = ZoomEvent(
+            start: 3, duration: 1, scale: 2, focusX: 0.5, focusY: 0.5
+        )
+        let third = ZoomEvent(
+            start: 6, duration: 1, scale: 2, focusX: 0.5, focusY: 0.5
+        )
+        store.project = TimelineProject(
+            clips: [TimelineClip(sourceStart: 0, duration: 10)],
+            zooms: [first, second, third]
+        )
+
+        store.selectZooms(intersecting: 0.5...4.5)
+        XCTAssertEqual(store.selectedZoomIDs, [first.id, second.id])
+
+        // ⌘-click keeps toggling on top of the marquee selection.
+        store.toggleZoomSelection(third.id)
+        XCTAssertEqual(store.selectedZoomIDs.count, 3)
+        store.toggleZoomSelection(third.id)
+        XCTAssertEqual(store.selectedZoomIDs, [first.id, second.id])
+
+        store.deleteSelectedZooms()
+        XCTAssertEqual(store.project.zooms.map(\.id), [third.id])
     }
 
     func testDeleteCommandRemovesTheSelectedTimelineBlock() {
@@ -540,7 +687,7 @@ final class EditorStoreInteractionTests: XCTestCase {
             focusX: 0.5,
             focusY: 0.5
         )
-        let trailingAnnotation = EmphasisAnnotation(
+        let trailingAnnotation = Annotation(
             kind: .rectangle,
             start: 5,
             duration: 0.8,
@@ -567,7 +714,10 @@ final class EditorStoreInteractionTests: XCTestCase {
 
         XCTAssertEqual(store.project.clips.map(\.id), [second.id, third.id])
         XCTAssertTrue(store.project.zooms.isEmpty)
-        XCTAssertTrue(store.project.annotations.isEmpty)
+        XCTAssertFalse(
+            store.project.annotations.isEmpty,
+            "Source-time annotations survive clip deletion like cursor samples."
+        )
         XCTAssertEqual(store.timelineUndoTitle, "Undo Delete Clip")
 
         store.undoTimelineEdit()
@@ -795,7 +945,7 @@ final class EditorStoreInteractionTests: XCTestCase {
         XCTAssertNil(store.timelineUndoTitle)
     }
 
-    func testRedactionAndAnnotationDragsCreateSeparateAtomicUndos() {
+    func testRedactionDragsCreateAtomicUndo() {
         let store = EditorStore()
         let redaction = PrivacyRedaction(
             start: 1,
@@ -803,46 +953,23 @@ final class EditorStoreInteractionTests: XCTestCase {
             normalizedX: 0.5,
             normalizedY: 0.5
         )
-        let annotation = EmphasisAnnotation(
-            kind: .rectangle,
-            start: 2,
-            duration: 2,
-            normalizedStartX: 0.2,
-            normalizedStartY: 0.2,
-            normalizedEndX: 0.8,
-            normalizedEndY: 0.8
-        )
         store.project = TimelineProject(
             clips: [TimelineClip(sourceStart: 0, duration: 10)],
-            redactions: [redaction],
-            annotations: [annotation]
+            redactions: [redaction]
         )
         store.selectedRedactionID = redaction.id
-        store.selectedAnnotationID = annotation.id
 
         store.beginContinuousTimelineEdit(.redaction)
         store.setRedactionRange(id: redaction.id, start: 3, duration: 2.5)
         store.updateSelectedRedaction(width: 0.3, opacity: 0.8)
         store.moveSelectedRedaction(x: 0.7, y: 0.3)
         store.endContinuousTimelineEdit()
-        let redactionEditedProject = store.project
 
-        store.beginContinuousTimelineEdit(.annotation)
-        store.setAnnotationRange(id: annotation.id, start: 4, duration: 1.5)
-        store.setAnnotationRange(id: annotation.id, start: 5, duration: 1)
-        store.endContinuousTimelineEdit()
-
-        XCTAssertEqual(store.timelineUndoTitle, "Undo Edit Annotation")
-
-        store.undoTimelineEdit()
-
-        XCTAssertEqual(store.project, redactionEditedProject)
         XCTAssertEqual(store.timelineUndoTitle, "Undo Edit Privacy Block")
 
         store.undoTimelineEdit()
 
         XCTAssertEqual(store.project.redactions, [redaction])
-        XCTAssertEqual(store.project.annotations, [annotation])
     }
 
     func testPrivacyModeDragCreatesBlurRegionAtChosenBounds() throws {

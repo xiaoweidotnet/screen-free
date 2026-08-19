@@ -48,6 +48,26 @@ final class AudioAnalyzerTests: XCTestCase {
         XCTAssertGreaterThan(waveform[2], 0.2)
     }
 
+    func testFaintSpeechJustAboveNoiseFloorStaysVisible() {
+        // 噪底 0.008、正常人声 0.03+、微弱人声 0.011：
+        // 旧门限（噪底 × 1.8 = 0.0144）会把 0.011 的真实人声清零。
+        let waveform = AudioWaveformNormalizer.normalize(
+            [
+                0.008, 0.008, 0.008, 0.008,
+                0.03, 0.032,
+                0.011, 0.011,
+                0.008, 0.008, 0.008
+            ],
+            bins: 11
+        )
+
+        XCTAssertGreaterThan(waveform[6], 0, "贴着噪底的微弱人声必须显示波纹")
+        XCTAssertGreaterThan(waveform[7], 0, "贴着噪底的微弱人声必须显示波纹")
+        XCTAssertGreaterThan(waveform[4], 0)
+        XCTAssertEqual(waveform[0], 0, "噪底本身必须保持空白")
+        XCTAssertEqual(waveform[10], 0, "噪底本身必须保持空白")
+    }
+
     func testRecommendedGainRaisesQuietAudioWithoutPredictingClipping() {
         let analysis = AudioAnalysis(
             waveform: [0, 1, 0],

@@ -10,19 +10,24 @@ struct AudioAnalysis: Sendable {
     /// Absolute (not display-normalized) peaks sampled into a shared media
     /// timeline. Each outer index matches AVAsset's audio-track order.
     var trackPeakEnvelopes: [[Float]]
+    /// Gated per-track RMS: silence below the gate does not dilute the
+    /// measurement, so it reflects how loud the actual program material is.
+    var trackLoudness: [Float]
 
     init(
         waveform: [Float],
         rms: Float,
         peak: Float,
         trackPeaks: [Float] = [],
-        trackPeakEnvelopes: [[Float]] = []
+        trackPeakEnvelopes: [[Float]] = [],
+        trackLoudness: [Float] = []
     ) {
         self.waveform = waveform
         self.rms = rms
         self.peak = peak
         self.trackPeaks = trackPeaks
         self.trackPeakEnvelopes = trackPeakEnvelopes
+        self.trackLoudness = trackLoudness
     }
 
     static let empty = AudioAnalysis(
@@ -30,7 +35,8 @@ struct AudioAnalysis: Sendable {
         rms: 0,
         peak: 0,
         trackPeaks: [],
-        trackPeakEnvelopes: []
+        trackPeakEnvelopes: [],
+        trackLoudness: []
     )
 
     var recommendedGain: Double {
@@ -80,9 +86,11 @@ enum AudioWaveformNormalizer {
         let adaptiveFloor: Float
         if audibleLevels.count >= 4,
            rawCeiling >= estimatedNoiseFloor * 3 {
+            // 1.35 只压掉噪底本身；紧贴噪底的真实微弱人声
+            // （≥ 噪底的 1.35 倍）必须保留为可见波纹。
             adaptiveFloor = max(
                 absoluteSilenceFloor,
-                estimatedNoiseFloor * 1.8
+                estimatedNoiseFloor * 1.35
             )
         } else {
             // Continuous low-level music or speech has no distinct noise/voice
@@ -113,9 +121,16 @@ struct AudioAnalyzer: Sendable {
         var rms: Float
         var peak: Float
         var peakEnvelope: [Float]
+        /// RMS measured only across chunks that carry signal above the gate,
+        /// so long silences cannot make quiet speech look even quieter.
+        var gatedLoudness: Float
     }
 
-    func analyze(url: URL, bins: Int = 2048) async throws -> AudioAnalysis {
+    /// Chunks quieter than -60 dBFS RMS are treated as silence for the
+    /// loudness measurement.
+    private static let loudnessGateFloor: Float = 0.001
+
+    func analyze(url: URL, bins: Int = 8192) async throws -> AudioAnalysis {
         try await Task.detached(priority: .utility) {
             try await analyzeSynchronously(url: url, bins: bins)
         }.value
@@ -134,6 +149,7 @@ struct AudioAnalyzer: Sendable {
         var analyses: [TrackAnalysis] = []
         var trackPeaks: [Float] = []
         var trackPeakEnvelopes: [[Float]] = []
+        var trackLoudness: [Float] = []
         for track in tracks {
             if let analysis = try analyze(
                 track: track,
@@ -144,6 +160,7 @@ struct AudioAnalyzer: Sendable {
                 analyses.append(analysis)
                 trackPeaks.append(analysis.peak)
                 trackPeakEnvelopes.append(analysis.peakEnvelope)
+                trackLoudness.append(analysis.gatedLoudness)
             } else {
                 // Keep analysis indices aligned with AVAsset's audio-track
                 // order, even when an individual track cannot be decoded.
@@ -151,6 +168,7 @@ struct AudioAnalyzer: Sendable {
                 trackPeakEnvelopes.append(
                     Array(repeating: 0, count: safeBins)
                 )
+                trackLoudness.append(0)
             }
         }
         guard !analyses.isEmpty else { return .empty }
@@ -187,7 +205,8 @@ struct AudioAnalyzer: Sendable {
             rms: Float(sqrt(combinedRMSSquare)),
             peak: concurrentPeak,
             trackPeaks: trackPeaks,
-            trackPeakEnvelopes: trackPeakEnvelopes
+            trackPeakEnvelopes: trackPeakEnvelopes,
+            trackLoudness: trackLoudness
         )
     }
 
@@ -218,6 +237,8 @@ struct AudioAnalyzer: Sendable {
         var chunkLevels: [Float] = []
         var totalSquares: Double = 0
         var totalSamples = 0
+        var gatedSquares: Double = 0
+        var gatedSamples = 0
         var globalPeak: Float = 0
         var peakEnvelope = Array(repeating: Float.zero, count: bins)
         var hasAlignedPeakEnvelope = true
@@ -257,9 +278,12 @@ struct AudioAnalyzer: Sendable {
             totalSquares += chunkSquares
             totalSamples += count
             globalPeak = max(globalPeak, chunkPeak)
-            chunkLevels.append(
-                Float(sqrt(chunkSquares / Double(count)))
-            )
+            let chunkRMS = Float(sqrt(chunkSquares / Double(count)))
+            if chunkRMS > Self.loudnessGateFloor {
+                gatedSquares += chunkSquares
+                gatedSamples += count
+            }
+            chunkLevels.append(chunkRMS)
             let presentationTime = CMSampleBufferGetPresentationTimeStamp(
                 sampleBuffer
             ).seconds
@@ -325,7 +349,10 @@ struct AudioAnalyzer: Sendable {
             ),
             rms: Float(sqrt(totalSquares / Double(totalSamples))),
             peak: globalPeak,
-            peakEnvelope: hasAlignedPeakEnvelope ? peakEnvelope : []
+            peakEnvelope: hasAlignedPeakEnvelope ? peakEnvelope : [],
+            gatedLoudness: gatedSamples > 0
+                ? Float(sqrt(gatedSquares / Double(gatedSamples)))
+                : 0
         )
     }
 }
