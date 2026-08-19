@@ -337,6 +337,53 @@ final class TimelineProjectTests: XCTestCase {
             accuracy: 0.001
         )
 
+        let denseSamples = (0...20_000).map { index in
+            CursorSample(
+                time: Double(index) / 60,
+                normalizedX: CGFloat(index) / 20_000,
+                normalizedY: 0.5
+            )
+        }
+        let denseProject = TimelineProject(
+            clips: [
+                TimelineClip(sourceStart: 0, duration: Double(20_000) / 60)
+            ],
+            cursorSamples: denseSamples
+        )
+        let midpoint = try XCTUnwrap(
+            denseProject.cursorSample(
+                atTimelineTime: 100 + (1.0 / 120),
+                using: denseSamples,
+                freezeBeforeEnd: 0,
+                smoothMovement: true
+            )
+        )
+        XCTAssertEqual(midpoint.normalizedX, 0.300_025, accuracy: 0.001)
+        let nearest = try XCTUnwrap(
+            denseProject.cursorSample(
+                atTimelineTime: 100.001,
+                using: denseSamples,
+                freezeBeforeEnd: 0,
+                smoothMovement: false
+            )
+        )
+        XCTAssertEqual(nearest.time, 100, accuracy: 0.01)
+
+        let lookupStarted = CFAbsoluteTimeGetCurrent()
+        for step in 0..<400 {
+            _ = denseProject.cursorSample(
+                atTimelineTime: Double(step) * 0.5,
+                using: denseSamples,
+                freezeBeforeEnd: 0,
+                smoothMovement: true
+            )
+        }
+        XCTAssertLessThan(
+            CFAbsoluteTimeGetCurrent() - lookupStarted,
+            0.05,
+            "Cursor lookup on a 15-minute 60 Hz trail must stay logarithmic."
+        )
+
         let jitterProject = TimelineProject(
             clips: [TimelineClip(sourceStart: 0, duration: 1)],
             cursorSamples: [

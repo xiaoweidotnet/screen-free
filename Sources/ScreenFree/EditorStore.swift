@@ -81,6 +81,15 @@ final class EditorStore: ObservableObject {
         case seek
     }
 
+    private struct ProcessedCursorCacheKey: Equatable {
+        var sampleCount: Int
+        var firstID: UUID?
+        var lastID: UUID?
+        var removeShakes: Bool
+        var shakeThreshold: CGFloat
+        var optimizeRapidChanges: Bool
+    }
+
     private struct TimelineEditorSnapshot {
         var project: TimelineProject
         var selectedClipID: UUID?
@@ -297,11 +306,15 @@ final class EditorStore: ObservableObject {
     @Published private(set) var recordingHistory: [RecordingHistoryItem] = []
 
     @Published var playhead: TimeInterval = 0
-    private let scrubSeekInterval: TimeInterval = 1.0 / 60.0
+    /// 20 Hz is enough for the paused preview to track a drag. 60 Hz was
+    /// saturating 4K decode on the main thread, so the playhead line itself
+    /// hitch-stepped with every pointer event.
+    private let scrubSeekInterval: TimeInterval = 1.0 / 20.0
     private var isScrubSeekInFlight = false
     private var pendingScrubTime: TimeInterval?
     private var lastScrubSeekTarget: TimeInterval?
     private var lastScrubSeekDispatchAt: UInt64?
+    private var scrubSeekRetry: DispatchWorkItem?
     /// True while an interactive drag owns the playhead. The periodic time
     /// observer must not write the playhead while this is set, and playback
     /// resumes on release when the drag interrupted an active playback.
@@ -322,6 +335,8 @@ final class EditorStore: ObservableObject {
     @Published var exportQuality: ExportQuality = .studio
     @Published var exportFrameRate = 60
     @Published var audioAnalysis: AudioAnalysis = .empty
+    private var processedCursorCacheKey: ProcessedCursorCacheKey?
+    private var processedCursorCache: [CursorSample] = []
     @Published private(set) var timelineThumbnails: [TimelineThumbnailFrame] = []
     @Published var backgroundMusicURL: URL?
     @Published var backgroundMusicVolume: Double = 0.2 {
@@ -1995,6 +2010,8 @@ final class EditorStore: ObservableObject {
         pendingScrubTime = nil
         lastScrubSeekDispatchAt = nil
         lastScrubSeekTarget = target
+        scrubSeekRetry?.cancel()
+        scrubSeekRetry = nil
         let shouldResume = isScrubbing && wasPlayingBeforeScrub
         isScrubbing = false
         wasPlayingBeforeScrub = false
@@ -2012,12 +2029,27 @@ final class EditorStore: ObservableObject {
         let now = DispatchTime.now().uptimeNanoseconds
         if let last = lastScrubSeekDispatchAt,
            Double(now - last) / 1_000_000_000 < scrubSeekInterval {
+            scheduleScrubSeekRetry()
             return
         }
         pendingScrubTime = nil
         lastScrubSeekDispatchAt = now
         lastScrubSeekTarget = target
         performScrubSeek(to: target)
+    }
+
+    private func scheduleScrubSeekRetry() {
+        guard scrubSeekRetry == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.scrubSeekRetry = nil
+            self.dispatchDueScrubSeek()
+        }
+        scrubSeekRetry = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + scrubSeekInterval,
+            execute: work
+        )
     }
 
     private func performScrubSeek(to timelineTime: TimeInterval) {
@@ -2028,10 +2060,11 @@ final class EditorStore: ObservableObject {
         let sourceTime = context.clip.sourceStart
             + localTimeline * context.clip.playbackRate
         let cmTime = CMTime(seconds: sourceTime, preferredTimescale: 600)
-        // Half a frame of tolerance lets the decoder land on a nearby frame
-        // instead of decoding from the previous keyframe on every drag tick.
+        // Two frames of tolerance lets the 4K decoder reuse a nearby
+        // decoded frame instead of walking back to the previous keyframe
+        // on every drag tick. Release still does an exact seek.
         let tolerance = CMTime(
-            seconds: 0.5 / sourceFrameRate.clamped(to: 15...120),
+            seconds: 2 / sourceFrameRate.clamped(to: 15...120),
             preferredTimescale: 600
         )
         isScrubSeekInFlight = true
@@ -3683,11 +3716,36 @@ final class EditorStore: ObservableObject {
         )
     }
 
+    func previewCursorSamples() -> [CursorSample] {
+        let key = ProcessedCursorCacheKey(
+            sampleCount: project.cursorSamples.count,
+            firstID: project.cursorSamples.first?.id,
+            lastID: project.cursorSamples.last?.id,
+            removeShakes: removeCursorShakes,
+            shakeThreshold: cursorShakeThreshold,
+            optimizeRapidChanges: optimizeRapidCursorChanges
+        )
+        if processedCursorCacheKey == key {
+            return processedCursorCache
+        }
+        let samples = project.processedCursorSamples(
+            removeShakes: removeCursorShakes,
+            shakeThreshold: cursorShakeThreshold,
+            optimizeRapidChanges: optimizeRapidCursorChanges
+        )
+        processedCursorCacheKey = key
+        processedCursorCache = samples
+        return samples
+    }
+
     func resolvedMotionBlur(
         at time: TimeInterval? = nil,
         renderSize: CGSize
     ) -> ResolvedMotionBlur {
-        MotionBlurResolver.resolve(
+        if isScrubbing {
+            return .zero
+        }
+        return MotionBlurResolver.resolve(
             at: time ?? playhead,
             project: project,
             zoomMotion: currentZoomMotionStyle,
@@ -3698,7 +3756,8 @@ final class EditorStore: ObservableObject {
             removeCursorShakes: removeCursorShakes,
             cursorShakeThreshold: cursorShakeThreshold,
             optimizeRapidCursorChanges: optimizeRapidCursorChanges,
-            smoothCursorMovement: smoothCursorMovement
+            smoothCursorMovement: smoothCursorMovement,
+            processedCursorSamples: previewCursorSamples()
         )
     }
 
@@ -3879,10 +3938,11 @@ final class EditorStore: ObservableObject {
 
     private func installPlayerObserver() {
         guard timeObserver == nil else { return }
-        // 60 Hz: the playhead line and the playhead-driven zoom/pan preview
-        // animate at display rate instead of a visibly stepped 30 Hz.
+        // 30 Hz keeps playhead-driven preview work (cursor follow, zoom)
+        // off the display-rate path. Dragging uses `playhead` directly and
+        // does not go through this observer.
         timeObserver = player.addPeriodicTimeObserver(
-            forInterval: CMTime(value: 1, timescale: 60),
+            forInterval: CMTime(value: 1, timescale: 30),
             queue: .main
         ) { [weak self] time in
             guard let self else { return }

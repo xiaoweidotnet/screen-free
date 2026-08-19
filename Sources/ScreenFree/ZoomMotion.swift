@@ -204,7 +204,8 @@ enum ZoomFocusResolver {
         cursorShakeThreshold: CGFloat,
         optimizeRapidCursorChanges: Bool,
         smoothCursorMovement: Bool,
-        processedCursorSamples: [CursorSample]? = nil
+        processedCursorSamples: [CursorSample]? = nil,
+        interactive: Bool = false
     ) -> CGPoint {
         guard zoomState.zoom.resolvedFollowsCursor else {
             return CGPoint(
@@ -213,10 +214,6 @@ enum ZoomFocusResolver {
             )
         }
 
-        let chainStart = continuousChainStart(
-            containing: zoomState.zoom,
-            zooms: project.zooms
-        )
         let cursorSamples = processedCursorSamples
             ?? project.processedCursorSamples(
                 removeShakes: removeCursorShakes,
@@ -235,6 +232,21 @@ enum ZoomFocusResolver {
                 CGPoint(x: $0.normalizedX, y: $0.normalizedY)
             }
         }
+
+        // Interactive scrubbing only needs the current cursor. Simulating
+        // the 30 Hz low-pass from the start of a long zoom chain on every
+        // pointer event is what made the playhead hitch on 15-minute clips.
+        if interactive, let current = cursor(at: time) {
+            return CGPoint(
+                x: current.x.clamped(to: 0...1),
+                y: current.y.clamped(to: 0...1)
+            )
+        }
+
+        let chainStart = continuousChainStart(
+            containing: zoomState.zoom,
+            zooms: project.zooms
+        )
 
         // 从缩放链起点的光标位置初始化相机，再沿时间轴以 30Hz 步进做
         // 因果一阶低通。链内所有缩放共享同一起点与同一条模拟轨迹，

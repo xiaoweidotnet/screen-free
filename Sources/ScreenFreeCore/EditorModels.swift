@@ -762,7 +762,13 @@ public struct TimelineProject: Equatable, Codable, Sendable {
         shakeThreshold: CGFloat,
         optimizeRapidChanges: Bool
     ) -> [CursorSample] {
-        let sorted = cursorSamples.sorted { $0.time < $1.time }
+        let isAlreadyOrdered = cursorSamples.count < 2
+            || (1..<cursorSamples.count).allSatisfy {
+                cursorSamples[$0 - 1].time <= cursorSamples[$0].time
+            }
+        let sorted = isAlreadyOrdered
+            ? cursorSamples
+            : cursorSamples.sorted { $0.time < $1.time }
         guard sorted.count >= 3 else { return sorted }
         let threshold = shakeThreshold.clamped(to: 0.002...0.08)
         var filtered: [CursorSample] = []
@@ -825,14 +831,41 @@ public struct TimelineProject: Equatable, Codable, Sendable {
         return smoothed
     }
 
+    /// First index whose sample time is ≥ `sourceTime`, or `samples.count`.
+    /// `samples` must already be sorted by time.
+    private func cursorIndex(
+        atSourceTime sourceTime: TimeInterval,
+        in samples: [CursorSample]
+    ) -> Int {
+        var low = 0
+        var high = samples.count
+        while low < high {
+            let mid = (low + high) / 2
+            if samples[mid].time < sourceTime {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        return low
+    }
+
     private func nearestCursor(
         to time: TimeInterval,
         in samples: [CursorSample]
     ) -> CursorSample? {
-        guard let sourceTime = sourceTime(forTimelineTime: time) else { return nil }
-        return samples.min {
-            abs($0.time - sourceTime) < abs($1.time - sourceTime)
+        guard let sourceTime = sourceTime(forTimelineTime: time),
+              !samples.isEmpty else {
+            return nil
         }
+        let index = cursorIndex(atSourceTime: sourceTime, in: samples)
+        if index <= 0 { return samples[0] }
+        if index >= samples.count { return samples[samples.count - 1] }
+        let upper = samples[index]
+        let lower = samples[index - 1]
+        return abs(upper.time - sourceTime) < abs(lower.time - sourceTime)
+            ? upper
+            : lower
     }
 
     private func interpolatedCursor(
@@ -849,9 +882,8 @@ public struct TimelineProject: Equatable, Codable, Sendable {
         }
         if sourceTime <= first.time { return first }
         if sourceTime >= last.time { return last }
-        guard let upperIndex = samples.firstIndex(
-            where: { $0.time >= sourceTime }
-        ), upperIndex > 0 else {
+        let upperIndex = cursorIndex(atSourceTime: sourceTime, in: samples)
+        guard upperIndex > 0, upperIndex < samples.count else {
             return nearestCursor(to: time, in: samples)
         }
         let lower = samples[upperIndex - 1]
