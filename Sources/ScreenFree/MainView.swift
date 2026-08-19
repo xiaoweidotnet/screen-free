@@ -448,11 +448,7 @@ struct MainView: View {
             let zoomState = store.activeZoomMotion()
             let zoom = zoomState?.zoom
             let scale = zoomState?.scale ?? 1
-            let processedCursorSamples = store.project.processedCursorSamples(
-                removeShakes: store.removeCursorShakes,
-                shakeThreshold: store.cursorShakeThreshold,
-                optimizeRapidChanges: store.optimizeRapidCursorChanges
-            )
+            let processedCursorSamples = store.previewCursorSamples()
             let cursor = store.project.cursorSample(
                 atTimelineTime: store.playhead,
                 using: processedCursorSamples,
@@ -472,7 +468,8 @@ struct MainView: View {
                     optimizeRapidCursorChanges:
                         store.optimizeRapidCursorChanges,
                     smoothCursorMovement: store.smoothCursorMovement,
-                    processedCursorSamples: processedCursorSamples
+                    processedCursorSamples: processedCursorSamples,
+                    interactive: store.isScrubbing
                 )
             }
             let focusX = zoomFocus?.x ?? zoom?.focusX ?? 0.5

@@ -52,7 +52,8 @@ enum MotionBlurResolver {
         removeCursorShakes: Bool,
         cursorShakeThreshold: CGFloat,
         optimizeRapidCursorChanges: Bool,
-        smoothCursorMovement: Bool
+        smoothCursorMovement: Bool,
+        processedCursorSamples: [CursorSample]? = nil
     ) -> ResolvedMotionBlur {
         let style = style.clamped()
         guard style.enabled, style.strength > 0,
@@ -63,22 +64,24 @@ enum MotionBlurResolver {
         let currentTime = time.clamped(to: 0...project.duration)
         let previousTime = max(0, currentTime - sampleInterval)
         let elapsed = max(1 / 240, currentTime - previousTime)
+        let samples = processedCursorSamples
+            ?? project.processedCursorSamples(
+                removeShakes: removeCursorShakes,
+                shakeThreshold: cursorShakeThreshold,
+                optimizeRapidChanges: optimizeRapidCursorChanges
+            )
         let currentCursor = project.cursorSample(
             atTimelineTime: currentTime,
+            using: samples,
             freezeBeforeEnd: cursorTailFreeze,
             loopToStart: cursorLoopToStart,
-            removeShakes: removeCursorShakes,
-            shakeThreshold: cursorShakeThreshold,
-            optimizeRapidChanges: optimizeRapidCursorChanges,
             smoothMovement: smoothCursorMovement
         )
         let previousCursor = project.cursorSample(
             atTimelineTime: previousTime,
+            using: samples,
             freezeBeforeEnd: cursorTailFreeze,
             loopToStart: cursorLoopToStart,
-            removeShakes: removeCursorShakes,
-            shakeThreshold: cursorShakeThreshold,
-            optimizeRapidChanges: optimizeRapidCursorChanges,
             smoothMovement: smoothCursorMovement
         )
         let cursorVelocity: CGFloat
