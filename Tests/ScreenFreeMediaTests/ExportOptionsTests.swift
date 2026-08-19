@@ -226,6 +226,43 @@ final class ExportOptionsTests: XCTestCase {
         XCTAssertGreaterThan(try XCTUnwrap(socialLimit), try XCTUnwrap(lowLimit))
     }
 
+    func testProcessingEstimateStaysNearMeasuredExportSpeed() {
+        // Regression: the old heuristic predicted over 80 minutes for a
+        // 15-minute 4K 60 fps export that actually finishes in about
+        // 8–9 minutes on Apple Silicon, scaring users away from exporting.
+        let fifteenMinutes: TimeInterval = 15 * 60
+        let estimate = ExportEstimateCalculator.estimate(
+            timelineDuration: fifteenMinutes,
+            dimensions: ExportDimensions(width: 3_840, height: 2_160),
+            frameRate: 60,
+            format: .mp4,
+            quality: .studio
+        )
+        XCTAssertLessThan(
+            estimate.processingDuration,
+            20 * 60,
+            "The 4K 60 fps estimate must stay near the measured 0.55× export speed."
+        )
+        XCTAssertGreaterThan(
+            estimate.processingDuration,
+            fifteenMinutes * 0.3,
+            "The estimate should not promise a faster export than the pipeline delivers."
+        )
+
+        let shortClip = ExportEstimateCalculator.estimate(
+            timelineDuration: 30,
+            dimensions: ExportDimensions(width: 1_920, height: 1_080),
+            frameRate: 30,
+            format: .mp4,
+            quality: .studio
+        )
+        XCTAssertLessThan(
+            shortClip.processingDuration,
+            30,
+            "Small 1080p exports finish far faster than the timeline duration."
+        )
+    }
+
     private func makeTwoTrackAudioAsset(
         at outputURL: URL,
         directory: URL
