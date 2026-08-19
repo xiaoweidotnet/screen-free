@@ -6,34 +6,24 @@ import ScreenFreeCore
 struct MicrophoneEnhancementSettings: Equatable, Sendable {
     var reduceNoise: Bool
     var normalizeVolume: Bool
-    var targetRMS: Float
-    var minimumGain: Float
+    /// Linear RMS target for the gated program material. 0.16 ≈ −16 dBFS,
+    /// comparable to the voice loudness other screen recorders deliver.
+    var targetLoudness: Float
     var maximumGain: Float
-    var initialGain: Float
     var outputCeiling: Float
-    var compressionThreshold: Float
-    var compressionRatio: Float
 
     init(
         reduceNoise: Bool,
         normalizeVolume: Bool,
-        targetRMS: Float = 0.16,
-        minimumGain: Float = 0.5,
-        maximumGain: Float = 8,
-        initialGain: Float = 1,
-        outputCeiling: Float = 0.95,
-        compressionThreshold: Float = 0.95,
-        compressionRatio: Float = 1
+        targetLoudness: Float = 0.16,
+        maximumGain: Float = 32,
+        outputCeiling: Float = 0.95
     ) {
         self.reduceNoise = reduceNoise
         self.normalizeVolume = normalizeVolume
-        self.targetRMS = targetRMS
-        self.minimumGain = minimumGain
+        self.targetLoudness = targetLoudness
         self.maximumGain = maximumGain
-        self.initialGain = initialGain
         self.outputCeiling = outputCeiling
-        self.compressionThreshold = compressionThreshold
-        self.compressionRatio = compressionRatio
     }
 
     static let disabled = MicrophoneEnhancementSettings(
@@ -41,18 +31,20 @@ struct MicrophoneEnhancementSettings: Equatable, Sendable {
         normalizeVolume: false
     )
 
+    /// System audio is usually mixed and mastered already; boost quiet
+    /// material moderately and never attenuate loud content, the limiter
+    /// keeps peaks under the ceiling.
     static let systemAudioLoudness = MicrophoneEnhancementSettings(
         reduceNoise: false,
         normalizeVolume: true,
-        targetRMS: 0.28,
-        minimumGain: 3.2,
-        maximumGain: 4,
-        initialGain: 3.4,
-        outputCeiling: 0.96,
-        compressionThreshold: 0.55,
-        compressionRatio: 4
+        targetLoudness: 0.16,
+        maximumGain: 8,
+        outputCeiling: 0.95
     )
 
+    /// Microphones (especially wireless receivers) can deliver very low
+    /// raw levels, so speech needs far more available gain than system
+    /// audio to reach the loudness target.
     static func microphoneLoudness(
         reduceNoise: Bool,
         normalizeVolume: Bool
@@ -60,18 +52,22 @@ struct MicrophoneEnhancementSettings: Equatable, Sendable {
         MicrophoneEnhancementSettings(
             reduceNoise: reduceNoise,
             normalizeVolume: normalizeVolume,
-            targetRMS: 0.24,
-            minimumGain: 2.2,
-            maximumGain: 10,
-            initialGain: 2.4,
-            outputCeiling: 0.96,
-            compressionThreshold: 0.62,
-            compressionRatio: 3
+            targetLoudness: 0.16,
+            maximumGain: 32,
+            outputCeiling: 0.95
         )
     }
 
     var isEnabled: Bool {
         reduceNoise || normalizeVolume
+    }
+
+    var normalizerConfiguration: LoudnessNormalizer.Configuration {
+        LoudnessNormalizer.Configuration(
+            targetLoudness: targetLoudness,
+            maximumGain: maximumGain,
+            outputCeiling: outputCeiling
+        )
     }
 }
 
@@ -79,7 +75,9 @@ final class MicrophoneSignalProcessor: @unchecked Sendable {
     private let settings: MicrophoneEnhancementSettings
     private var previousInput: [Float] = []
     private var previousOutput: [Float] = []
-    private var automaticGain: [Float] = []
+    /// One normalizer per channel-plane offset so non-interleaved layouts
+    /// keep independent state, mirroring the filter state arrays above.
+    private var normalizers: [Int: LoudnessNormalizer] = [:]
 
     init(settings: MicrophoneEnhancementSettings) {
         self.settings = settings
@@ -88,7 +86,16 @@ final class MicrophoneSignalProcessor: @unchecked Sendable {
     func reset() {
         previousInput.removeAll(keepingCapacity: true)
         previousOutput.removeAll(keepingCapacity: true)
-        automaticGain.removeAll(keepingCapacity: true)
+        normalizers.values.forEach { $0.reset() }
+    }
+
+    private func normalizer(forChannelOffset offset: Int) -> LoudnessNormalizer {
+        if let existing = normalizers[offset] { return existing }
+        let created = LoudnessNormalizer(
+            configuration: settings.normalizerConfiguration
+        )
+        normalizers[offset] = created
+        return created
     }
 
     /// Returns the buffer that should be appended to `AVAssetWriter`.
@@ -400,15 +407,8 @@ final class MicrophoneSignalProcessor: @unchecked Sendable {
                     count: stateCount - previousOutput.count
                 )
             )
-            automaticGain.append(
-                contentsOf: repeatElement(
-                    settings.initialGain,
-                    count: stateCount - automaticGain.count
-                )
-            )
         }
 
-        let gainIndex = channelOffset
         if settings.reduceNoise {
             let cutoff: Float = 80
             let delta = Float(1 / max(8_000, sampleRate))
@@ -428,27 +428,11 @@ final class MicrophoneSignalProcessor: @unchecked Sendable {
         }
 
         if settings.normalizeVolume {
-            let rms = rootMeanSquare(samples)
-            if rms > 0.000_01 {
-                let desiredGain = (settings.targetRMS / rms).clamped(
-                    to: settings.minimumGain...settings.maximumGain
-                )
-                let response: Float = desiredGain < automaticGain[gainIndex]
-                    ? 0.45
-                    : 0.2
-                automaticGain[gainIndex] += (
-                    desiredGain - automaticGain[gainIndex]
-                ) * response
-            }
-            for index in samples.indices {
-                let amplified = samples[index] * automaticGain[gainIndex]
-                samples[index] = compress(
-                    amplified,
-                    threshold: settings.compressionThreshold,
-                    ratio: settings.compressionRatio,
-                    ceiling: settings.outputCeiling
-                )
-            }
+            normalizer(forChannelOffset: channelOffset).process(
+                samples,
+                channelCount: channelCount,
+                sampleRate: sampleRate
+            )
         }
 
         if settings.reduceNoise {
@@ -458,8 +442,9 @@ final class MicrophoneSignalProcessor: @unchecked Sendable {
             let gateThreshold: Float
             if settings.normalizeVolume {
                 let inputFloor: Float = 0.000_3
+                let appliedGain = normalizers[channelOffset]?.currentGain ?? 1
                 gateThreshold = (
-                    inputFloor * automaticGain[gainIndex]
+                    inputFloor * appliedGain
                 ).clamped(to: 0.000_3...0.004)
             } else {
                 gateThreshold = 0.006
@@ -473,30 +458,6 @@ final class MicrophoneSignalProcessor: @unchecked Sendable {
                 }
             }
         }
-    }
-
-    private func compress(
-        _ sample: Float,
-        threshold: Float,
-        ratio: Float,
-        ceiling: Float
-    ) -> Float {
-        let safeCeiling = ceiling.clamped(to: 0.1...0.99)
-        let magnitude = abs(sample)
-        guard ratio > 1,
-              threshold > 0,
-              threshold < safeCeiling,
-              magnitude > threshold else {
-            return sample.clamped(to: -safeCeiling...safeCeiling)
-        }
-        let available = safeCeiling - threshold
-        let compressed = threshold
-            + available
-                * tanh((magnitude - threshold) / (available * ratio))
-        return copysign(
-            min(safeCeiling, compressed),
-            sample
-        )
     }
 
     private func rootMeanSquare(

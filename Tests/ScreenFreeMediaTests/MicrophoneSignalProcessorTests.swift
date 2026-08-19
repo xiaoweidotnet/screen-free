@@ -255,6 +255,44 @@ final class MicrophoneSignalProcessorTests: XCTestCase {
         )
     }
 
+    func testWirelessMicrophoneLevelReachesUsableLoudness() {
+        // Regression: real recordings made with a wireless microphone came
+        // in around −48 dBFS RMS and ended up at only ~−27 LUFS because the
+        // old per-buffer AGC capped its gain at ×10. Speech this quiet must
+        // still reach a clearly audible level.
+        let processor = MicrophoneSignalProcessor(
+            settings: .microphoneLoudness(
+                reduceNoise: true,
+                normalizeVolume: true
+            )
+        )
+
+        var lastRMS: Float = 0
+        var maximumMagnitude: Float = 0
+        for chunk in 0..<40 {
+            var samples = (0..<2_400).flatMap { frame -> [Float] in
+                let value = 0.005_7 * sin(
+                    2 * Float.pi * 520
+                        * Float(frame + chunk * 2_400) / 48_000
+                )
+                return [value, value]
+            }
+            processor.process(&samples, channelCount: 2)
+            lastRMS = rms(samples)
+            maximumMagnitude = max(
+                maximumMagnitude,
+                samples.map { abs($0) }.max() ?? 0
+            )
+        }
+
+        XCTAssertGreaterThan(
+            lastRMS,
+            0.1,
+            "−48 dBFS wireless-microphone speech must be normalized into a usable loudness range."
+        )
+        XCTAssertLessThanOrEqual(maximumMagnitude, 0.96)
+    }
+
     func testNoiseReductionDoesNotSwallowWeakSpeechBeforeNormalization() {
         var weakSpeech = makeSine(
             amplitude: 0.002,
