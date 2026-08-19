@@ -330,11 +330,27 @@ enum ExportEstimateCalculator {
 
         let pixelFactor = pixels / Double(1_920 * 1_080)
         let frameFactor = safeFrameRate / 30
-        let formatFactor = format == .gif ? 1.65 : 0.72
-        let processingDuration = max(
-            1,
-            duration * max(0.18, pixelFactor) * frameFactor * formatFactor
-        )
+        let processingDuration: TimeInterval
+        switch format {
+        case .mp4:
+            // Calibrated against the real export pipeline on Apple Silicon:
+            // a 4K 60 fps export with canvas, cursor and click effects runs
+            // at about 0.55× of the timeline duration and is bound by
+            // hardware decode/encode, which scales with pixels × frame
+            // rate. 0.08 per 1080p30 unit keeps a little headroom so the
+            // shown estimate errs slightly long, plus a fixed setup cost.
+            processingDuration = max(
+                1,
+                duration * max(0.04, pixelFactor * frameFactor * 0.08) + 3
+            )
+        case .gif:
+            // GIF renders frame by frame through AVAssetImageGenerator and
+            // really is slower than the timeline.
+            processingDuration = max(
+                1,
+                duration * max(0.18, pixelFactor) * frameFactor * 1.65
+            )
+        }
         return ExportEstimate(
             fileSizeBytes: max(1, Int64(rawBytes.rounded())),
             processingDuration: processingDuration
